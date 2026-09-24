@@ -74,6 +74,21 @@ def split_tiles(
     return ordered[valid_count:], ordered[:valid_count]
 
 
+def build_yaml(dataset_path: Path, names: list[str] | None = None) -> dict:
+    """Return the data.yaml dict for a dataset layout (FR-3).
+
+    Key order is fixed (path, train, val, names) so the CLI can emit it with
+    yaml.safe_dump(sort_keys=False) and produce byte-identical files across
+    runs (NFR-1).
+    """
+    return {
+        "path": str(dataset_path),
+        "train": "images/train",
+        "val": "images/valid",
+        "names": list(names if names is not None else DEFAULT_NAMES),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     raise NotImplementedError  # placeholder; CLI lands with tasks 2.11-2.12
 

@@ -8,6 +8,7 @@ import csv
 from pathlib import Path
 
 import pytest
+import yaml
 
 import prepare_dataset as pd
 
@@ -109,3 +110,34 @@ class TestSplitTiles:
         train_b, valid_b = pd.split_tiles(shuffled, valid_ratio=0.2, seed=42)
         assert sorted(train_a) == sorted(train_b)
         assert sorted(valid_a) == sorted(valid_b)
+
+
+# ---------------------------------------------------------------------------
+# FR-3 / NFR-1: build_yaml
+# ---------------------------------------------------------------------------
+
+
+class TestBuildYaml:
+    def test_default_yaml_round_trips_with_plant_names(self, tmp_path):
+        dataset = tmp_path / "dataset"
+        data = pd.build_yaml(dataset)
+
+        dumped = yaml.safe_dump(data, sort_keys=False)
+        parsed = yaml.safe_load(dumped)
+
+        assert list(parsed.keys()) == ["path", "train", "val", "names"]
+        assert parsed["path"] == str(dataset)
+        assert parsed["train"] == "images/train"
+        assert parsed["val"] == "images/valid"
+        assert parsed["names"] == ["plant"]
+
+    def test_custom_names_round_trip(self, tmp_path):
+        data = pd.build_yaml(tmp_path / "dataset", names=["plant", "weed"])
+        parsed = yaml.safe_load(yaml.safe_dump(data, sort_keys=False))
+        assert parsed["names"] == ["plant", "weed"]
+
+    def test_dump_is_deterministic_byte_for_byte(self, tmp_path):
+        data = pd.build_yaml(tmp_path / "dataset")
+        first = yaml.safe_dump(data, sort_keys=False)
+        second = yaml.safe_dump(data, sort_keys=False)
+        assert first == second
