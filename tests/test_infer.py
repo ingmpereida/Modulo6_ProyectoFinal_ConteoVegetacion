@@ -146,3 +146,41 @@ class TestClipBox:
     def test_fully_outside_left_is_discarded(self):
         box = infer.Box((-200.0, 0.0, -50.0, 100.0), 0.7, 0)
         assert infer.clip_box(box, 4000, 3000) is None
+
+
+# ---------------------------------------------------------------------------
+# PR1 1.4: box_iou — intersection over union for two boxes
+# ---------------------------------------------------------------------------
+
+
+class TestBoxIou:
+    def test_identical_box_has_iou_1(self):
+        box = infer.Box((0.0, 0.0, 10.0, 10.0), 0.9, 0)
+        assert infer.box_iou(box, box) == 1.0
+
+    def test_disjoint_boxes_have_iou_0(self):
+        a = infer.Box((0.0, 0.0, 10.0, 10.0), 0.9, 0)
+        b = infer.Box((20.0, 20.0, 30.0, 30.0), 0.9, 0)
+        assert infer.box_iou(a, b) == 0.0
+
+    def test_half_width_overlap_is_exactly_0_5(self):
+        a = infer.Box((0.0, 0.0, 6.0, 10.0), 0.9, 0)
+        b = infer.Box((2.0, 0.0, 8.0, 10.0), 0.9, 0)
+        # inter = 4*10 = 40, union = 60 + 60 - 40 = 80
+        assert infer.box_iou(a, b) == 0.5
+
+    def test_partial_2d_overlap(self):
+        a = infer.Box((0.0, 0.0, 4.0, 4.0), 0.9, 0)
+        b = infer.Box((2.0, 2.0, 6.0, 6.0), 0.9, 0)
+        # inter = 2*2 = 4, union = 16 + 16 - 4 = 28
+        assert infer.box_iou(a, b) == pytest.approx(4 / 28)
+
+    def test_contained_box(self):
+        a = infer.Box((0.0, 0.0, 10.0, 10.0), 0.9, 0)
+        b = infer.Box((2.0, 2.0, 8.0, 8.0), 0.9, 0)
+        assert infer.box_iou(a, b) == pytest.approx(36 / 100)
+
+    def test_zero_area_box_returns_0_without_division_by_zero(self):
+        a = infer.Box((0.0, 0.0, 0.0, 10.0), 0.9, 0)  # zero width — degenerate
+        b = infer.Box((0.0, 0.0, 10.0, 10.0), 0.9, 0)
+        assert infer.box_iou(a, b) == 0.0

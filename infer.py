@@ -12,7 +12,7 @@ and argparse CLI arrive in PR2/PR3.
 from dataclasses import dataclass
 
 
-__all__ = ["Box", "filter_boxes", "project_box", "clip_box"]
+__all__ = ["Box", "filter_boxes", "project_box", "clip_box", "box_iou"]
 
 
 @dataclass(frozen=True)
@@ -67,3 +67,23 @@ def clip_box(box: Box, photo_w: int, photo_h: int) -> Box | None:
     if cx2 <= cx1 or cy2 <= cy1:
         return None
     return Box((cx1, cy1, cx2, cy2), box.conf, box.cls)
+
+
+def box_iou(a: Box, b: Box) -> float:
+    """Intersection-over-union of two pixel-space boxes (FR-4).
+
+    Valid for any position (overlapping, touching, disjoint, degenerate):
+    zero-area intersections or unions return 0.0 instead of dividing by
+    zero, so NMS never breaks on empty boxes.
+    """
+    ax1, ay1, ax2, ay2 = a.xyxy
+    bx1, by1, bx2, by2 = b.xyxy
+    inter_w = min(ax2, bx2) - max(ax1, bx1)
+    inter_h = min(ay2, by2) - max(ay1, by1)
+    if inter_w <= 0.0 or inter_h <= 0.0:
+        return 0.0
+    inter = inter_w * inter_h
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
