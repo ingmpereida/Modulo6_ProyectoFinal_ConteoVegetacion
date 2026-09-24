@@ -1219,6 +1219,109 @@ class TestMainRun:
         assert not out.exists()
         assert "escapes" in capsys.readouterr().err
 
+    def test_failed_write_leaves_existing_output_untouched(
+        self, tmp_path, make_tile_input, monkeypatch, capsys
+    ):
+        # R1-004/R4-003: the final CSV write is atomic (temp file + os.replace).
+        # If the write stage fails after the temp is produced (simulated
+        # disk-full at the rename), the pre-existing output must remain
+        # byte-untouched and no temp file may be left behind.
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F2",
+                    "photo": "DJI_0002.JPG",
+                    "photo_w": 960,
+                    "photo_h": 640,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 11), ("t2.png", 320, 0, 640, 640, 12)],
+                }
+            ]
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        model = FakeModel(
+            {
+                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
+                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
+            }
+        )
+        monkeypatch.setattr(infer, "load_model", lambda weights: model)
+
+        def _boom(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(infer.os, "replace", _boom)
+        out = tmp_path / "counts.csv"
+        out.write_text("sentinel\n", encoding="utf-8")
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 1
+        assert out.read_text(encoding="utf-8") == "sentinel\n"
+        assert "disk full" in capsys.readouterr().err
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith("counts.csv.")]
+        assert leftovers == []  # temp file cleaned up
+
+    def test_successful_run_writes_via_atomic_replace(
+        self, tmp_path, make_tile_input, monkeypatch
+    ):
+        # R4-003: successful runs write through os.replace(temp_sibling, output)
+        # — never truncate-in-place — so a reader never sees a half-written CSV.
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F2",
+                    "photo": "DJI_0002.JPG",
+                    "photo_w": 960,
+                    "photo_h": 640,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 11), ("t2.png", 320, 0, 640, 640, 12)],
+                }
+            ]
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        model = FakeModel(
+            {
+                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
+                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
+            }
+        )
+        monkeypatch.setattr(infer, "load_model", lambda weights: model)
+        calls = []
+        real_replace = infer.os.replace
+
+        def _spy(src, dst):
+            calls.append((Path(src), Path(dst)))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(infer.os, "replace", _spy)
+        out = tmp_path / "counts.csv"
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+            "F2,DJI_0002.JPG,1,2,1,t1.png;t2.png\n"
+        )
+        assert len(calls) == 1
+        src, dst = calls[0]
+        assert dst == out
+        assert src != out
+        assert src.parent == out.parent  # temp sibling lives in the same dir
+
 
 # ---------------------------------------------------------------------------
 # PR3 3.6: subprocess CLI contract — run the real `python infer.py` end-to-end

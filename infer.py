@@ -20,7 +20,9 @@ import argparse
 import csv
 import io
 import itertools
+import os
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -490,6 +492,33 @@ def _single_photo_tiles(path: Path) -> list[TileSpec]:
     ]
 
 
+def _write_output_atomic(output: Path, data: bytes) -> None:
+    """Write ``data`` to ``output`` atomically (R1-004/R4-003).
+
+    The bytes go to a temp file in the SAME directory as ``output`` (same
+    filesystem, so the final swap is atomic), are flushed and fsync'd, then
+    ``os.replace`` moves them over the target. A crash, kill, or disk-full
+    mid-write leaves any pre-existing output byte-untouched, and a reader
+    never observes a half-written CSV. On failure the temp file is unlinked.
+    """
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=output.parent, prefix=f"{output.name}.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, output)
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass  # already replaced (success) or never created — best effort
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the counting CLI and return the process exit code (FR-1).
 
@@ -546,9 +575,9 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
 
-        # Validate-then-write (D7): render once, write once, bytes only.
+        # Validate-then-write (D7): render once, write once atomically (R4-003).
         csv_text = render_csv(rows)
-        Path(args.output).write_bytes(csv_text.encode("utf-8"))
+        _write_output_atomic(Path(args.output), csv_text.encode("utf-8"))
         if args.summary:
             for line in render_summaries(rows):
                 print(line)
