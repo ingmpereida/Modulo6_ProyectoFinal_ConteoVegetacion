@@ -3,8 +3,11 @@
 Pillow>=10.0
 numpy>=1.26
 
-# YOLO training pipeline (prepare_dataset.py + suite pytest, FR-6)
-# Versiones elegidas el 2026-09-23; ultralytics se instala y verifica en la tarea 3.1 (gate F-1)
+# YOLO training pipeline (prepare_dataset.py + train.py, FR-6)
+# Versiones elegidas/verificadas el 2026-09-23 (gate F-1): ultralytics 8.4.161
+# verificado en Python 3.14.6; arrastra torch/torchvision. opencv-python se fija
+# explicitamente porque ultralytics lo declara sin pin (C-1).
 pytest==9.1.1
 PyYAML==6.0.3
 ultralytics==8.4.161
+opencv-python==5.0.0.93
