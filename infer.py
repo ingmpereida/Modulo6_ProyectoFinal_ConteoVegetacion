@@ -12,7 +12,14 @@ and argparse CLI arrive in PR2/PR3.
 from dataclasses import dataclass
 
 
-__all__ = ["Box", "filter_boxes", "project_box", "clip_box", "box_iou"]
+__all__ = [
+    "Box",
+    "filter_boxes",
+    "project_box",
+    "clip_box",
+    "box_iou",
+    "nms_dedup",
+]
 
 
 @dataclass(frozen=True)
@@ -87,3 +94,20 @@ def box_iou(a: Box, b: Box) -> float:
     if union <= 0.0:
         return 0.0
     return inter / union
+
+
+def nms_dedup(boxes: list[Box], iou: float) -> list[Box]:
+    """Greedy global IoU NMS: keep a box iff IoU with every kept box < iou.
+
+    Deterministic by construction (FR-4, NFR-2): boxes are processed sorted
+    by ``(-conf, original_index)`` — highest confidence first, ties broken
+    by input position — and the result comes back in that order (D3). A box
+    whose IoU with any already-kept box is ``>= iou`` is a duplicate of the
+    same plant and is suppressed (merge semantics, D2).
+    """
+    ordered = sorted(enumerate(boxes), key=lambda pair: (-pair[1].conf, pair[0]))
+    kept: list[Box] = []
+    for _, box in ordered:
+        if all(box_iou(box, kept_box) < iou for kept_box in kept):
+            kept.append(box)
+    return kept

@@ -184,3 +184,60 @@ class TestBoxIou:
         a = infer.Box((0.0, 0.0, 0.0, 10.0), 0.9, 0)  # zero width — degenerate
         b = infer.Box((0.0, 0.0, 10.0, 10.0), 0.9, 0)
         assert infer.box_iou(a, b) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# PR1 1.5: nms_dedup — deterministic global IoU NMS (FR-4, design D2/D3)
+# ---------------------------------------------------------------------------
+
+
+class TestNmsDedup:
+    def test_duplicate_boxes_merge_keeping_highest_conf(self):
+        a = infer.Box((0.0, 0.0, 320.0, 320.0), 0.9, 0)
+        b = infer.Box((0.0, 0.0, 320.0, 320.0), 0.8, 0)
+        kept = infer.nms_dedup([a, b], 0.5)
+        assert [k.conf for k in kept] == [0.9]
+
+    def test_disjoint_boxes_all_survive_in_conf_order(self):
+        a = infer.Box((0.0, 0.0, 100.0, 100.0), 0.9, 0)
+        b = infer.Box((200.0, 0.0, 300.0, 100.0), 0.8, 0)
+        kept = infer.nms_dedup([b, a], 0.5)  # input not sorted — output must be
+        assert [k.conf for k in kept] == [0.9, 0.8]
+
+    def test_low_overlap_below_threshold_survives(self):
+        a = infer.Box((0.0, 0.0, 100.0, 100.0), 0.9, 0)
+        b = infer.Box((70.0, 0.0, 170.0, 100.0), 0.8, 0)  # IoU = 30/170 ~ 0.18
+        kept = infer.nms_dedup([a, b], 0.5)
+        assert len(kept) == 2
+
+    def test_exact_threshold_overlap_merges(self):
+        # IoU exactly 0.5 == --iou -> suppressed (>= threshold merges, D2/D4)
+        a = infer.Box((0.0, 0.0, 6.0, 10.0), 0.9, 0)
+        b = infer.Box((2.0, 0.0, 8.0, 10.0), 0.9, 0)
+        kept = infer.nms_dedup([a, b], 0.5)
+        assert [k.xyxy for k in kept] == [(0.0, 0.0, 6.0, 10.0)]
+
+    def test_equal_conf_tie_breaks_by_lower_original_index(self):
+        # Same conf: the FIRST box in the input wins the merge (D3) — no
+        # salted hash() or RNG anywhere near the ordering.
+        first = infer.Box((0.0, 0.0, 10.0, 10.0), 0.8, 0)
+        second = infer.Box((1.0, 0.0, 11.0, 10.0), 0.8, 0)  # IoU ~ 0.82
+        kept = infer.nms_dedup([first, second], 0.5)
+        assert kept == [first]
+
+    def test_high_conf_suppresses_later_duplicates_but_keeps_distinct(self):
+        a = infer.Box((0.0, 0.0, 100.0, 100.0), 0.9, 0)
+        b = infer.Box((2.0, 2.0, 102.0, 102.0), 0.6, 0)  # IoU with a ~ 0.92
+        c = infer.Box((4.0, 4.0, 104.0, 104.0), 0.5, 0)  # IoU with a ~ 0.85
+        d = infer.Box((300.0, 0.0, 400.0, 100.0), 0.85, 0)  # disjoint
+        kept = infer.nms_dedup([a, b, c, d], 0.5)
+        assert [k.conf for k in kept] == [0.9, 0.85]
+
+    def test_kept_order_is_confidence_descending(self):
+        boxes = [
+            infer.Box((0.0, 0.0, 100.0, 100.0), 0.7, 0),
+            infer.Box((200.0, 0.0, 300.0, 100.0), 0.9, 0),
+            infer.Box((400.0, 0.0, 500.0, 100.0), 0.8, 0),
+        ]
+        kept = infer.nms_dedup(boxes, 0.5)
+        assert [k.conf for k in kept] == [0.9, 0.8, 0.7]
