@@ -61,3 +61,51 @@ class TestGroupFlights:
         assert [r["tile"] for r in groups["A"]] == ["t1.jpg", "t3.jpg"]
         assert [r["tile"] for r in groups["B"]] == ["t2.jpg", "t5.jpg"]
         assert [r["tile"] for r in groups["C"]] == ["t4.jpg"]
+
+
+# ---------------------------------------------------------------------------
+# FR-2 / NFR-1: split_tiles
+# ---------------------------------------------------------------------------
+
+
+class TestSplitTiles:
+    TEN_TILES = [f"DJI_0001_x{x:05d}_y00000.jpg" for x in range(10)]
+
+    def test_ten_tiles_split_eight_train_two_valid(self):
+        train, valid = pd.split_tiles(self.TEN_TILES, valid_ratio=0.2, seed=42)
+        assert len(train) == 8
+        assert len(valid) == 2
+
+    def test_same_seed_twice_yields_identical_sets(self):
+        first = pd.split_tiles(self.TEN_TILES, valid_ratio=0.2, seed=42)
+        second = pd.split_tiles(self.TEN_TILES, valid_ratio=0.2, seed=42)
+        assert first == second
+
+    def test_single_tile_flight_puts_all_in_train(self):
+        train, valid = pd.split_tiles(["DJI_0001_x00000_y00000.jpg"], seed=42)
+        assert train == ["DJI_0001_x00000_y00000.jpg"]
+        assert valid == []
+
+    def test_two_tiles_split_one_and_one(self):
+        tiles = ["DJI_0001_x00000_y00000.jpg", "DJI_0001_x00544_y00000.jpg"]
+        train, valid = pd.split_tiles(tiles, valid_ratio=0.2, seed=42)
+        assert len(train) == 1
+        assert len(valid) == 1
+        assert train + valid == sorted(tiles)
+
+    def test_half_ratio_splits_ten_five_and_five(self):
+        train, valid = pd.split_tiles(self.TEN_TILES, valid_ratio=0.5, seed=42)
+        assert len(train) == 5
+        assert len(valid) == 5
+
+    def test_no_tile_is_lost_or_duplicated(self):
+        train, valid = pd.split_tiles(self.TEN_TILES, valid_ratio=0.2, seed=7)
+        combined = sorted(train + valid)
+        assert combined == sorted(self.TEN_TILES)
+
+    def test_input_order_does_not_affect_split(self):
+        shuffled = list(reversed(self.TEN_TILES))
+        train_a, valid_a = pd.split_tiles(self.TEN_TILES, valid_ratio=0.2, seed=42)
+        train_b, valid_b = pd.split_tiles(shuffled, valid_ratio=0.2, seed=42)
+        assert sorted(train_a) == sorted(train_b)
+        assert sorted(valid_a) == sorted(valid_b)

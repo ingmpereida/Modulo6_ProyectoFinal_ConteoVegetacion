@@ -51,6 +51,29 @@ def group_flights(rows: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
+def split_tiles(
+    tiles: list[str],
+    valid_ratio: float = DEFAULT_VALID_RATIO,
+    seed: int = DEFAULT_SEED,
+) -> tuple[list[str], list[str]]:
+    """Split one flight's tiles into (train, valid) deterministically.
+
+    FR-2: per-flight split, fixed seed (NFR-1). n == 1 → valid is empty and
+    the tile goes to train; otherwise valid = clamp(round(valid_ratio * n),
+    1, n - 1). The input order never matters: the tile names are sorted and a
+    seeded Random drives the shuffle, so identical inputs + seed always
+    produce identical sets.
+    """
+    n = len(tiles)
+    if n == 1:
+        return list(tiles), []
+    valid_count = max(1, min(n - 1, round(valid_ratio * n)))
+    ordered = sorted(tiles)
+    rng = random.Random(seed)
+    rng.shuffle(ordered)
+    return ordered[valid_count:], ordered[:valid_count]
+
+
 def main(argv: list[str] | None = None) -> int:
     raise NotImplementedError  # placeholder; CLI lands with tasks 2.11-2.12
 
