@@ -511,6 +511,16 @@
         </div>
         <p class="field-hint">Estima varias plantas dentro de una mancha grande (copas de árboles muy juntas), según el tamaño típico detectado.</p>
       </div>
+      <div class="field">
+        <div class="toggle-row">
+          <span>Audio al finalizar</span>
+          <label class="switch">
+            <input type="checkbox" id="audioToggle" checked aria-label="Audio al finalizar">
+            <span class="slider-toggle"></span>
+          </label>
+        </div>
+        <p class="field-hint">Al terminar el conteo, se leerán automáticamente los resultados.</p>
+      </div>
     </div>
 
     <div class="divider"></div>
@@ -576,6 +586,7 @@
   const thresholdSlider = document.getElementById('threshold');
   const minSizeSlider = document.getElementById('minSize');
   const splitClusters = document.getElementById('splitClusters');
+  const audioToggle = document.getElementById('audioToggle');
   const thVal = document.getElementById('thVal');
   const minVal = document.getElementById('minVal');
   const totalCountEl = document.getElementById('totalCount');
@@ -590,6 +601,37 @@
   let displayCanvas = null, overlayCanvas = null;
   let displayScale = 1;
   let markers = [];
+  let lastSpokenSeq = -1;
+
+  // Pura: genera la frase hablada. Separada de los efectos de audio para poder
+  // testearla en Node (la cobertura debe leerse "34,5 por ciento", coma decimal).
+  function buildResultSpeech(total, groups, coverPctStr){
+    const coverNum = parseFloat(coverPctStr);
+    const coverText = isNaN(coverNum) ? 'sin dato' : (coverNum.toFixed(1).replace('.', ',') + ' por ciento');
+    return `Conteo de vegetación finalizado. Plantas detectadas: ${total}. Manchas analizadas: ${groups}. Porcentaje de cobertura verde: ${coverText}.`;
+  }
+
+  function speakResults(total, groups, coverPctStr, seq){
+    try {
+      const synth = window.speechSynthesis;
+      if (!synth) return;
+      if (synth.speaking || synth.pending) synth.cancel();
+      const utter = new SpeechSynthesisUtterance(buildResultSpeech(total, groups, coverPctStr));
+      utter.lang = 'es-ES';
+      utter.rate = 1.0;
+      utter.pitch = 1.0;
+      utter.onerror = () => console.warn('[audio] no se pudo reproducir el resumen:', utter.error);
+      // Chromium descarta una utterance si speak() se llama en el mismo call stack
+      // que un cancel() reciente; diferir un tick y descartar si llegó un conteo más nuevo.
+      setTimeout(() => {
+        if (seq !== detectionSeq) return;
+        try { synth.speak(utter); }
+        catch (err) { console.warn('[audio] no se pudo reproducir el resumen:', err); }
+      }, 60);
+    } catch (err) {
+      console.warn('[audio] speechSynthesis no disponible:', err);
+    }
+  }
 
   thresholdSlider.addEventListener('input', () => { thVal.textContent = thresholdSlider.value; });
   minSizeSlider.addEventListener('input', () => { minVal.textContent = minSizeSlider.value + ' px'; });
@@ -665,6 +707,8 @@
 
   function resetAll(){
     detectionSeq++; // invalidate any in-flight worker/inline result
+    // Cortar el audio en curso: un conteo cancelado no debe seguir leyéndose
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
     sourceImage = null;
     clearBtn.disabled = true;
     recalcBtn.disabled = true;
@@ -842,6 +886,11 @@
     void totalReadout.offsetWidth; // reinicia la transicion CSS
     totalReadout.classList.add('pulse');
     setTimeout(() => totalReadout.classList.remove('pulse'), 240);
+
+    if (audioToggle && audioToggle.checked && res.seq !== lastSpokenSeq) {
+      lastSpokenSeq = res.seq;
+      speakResults(res.markers.length, res.components, coverPctEl.textContent, res.seq);
+    }
   }
 
   // Web worker: keeps the UI responsive while counting large images.
@@ -861,8 +910,12 @@
       worker.onerror = function(){
         // Fall back to the inline path so the user is never left stuck
         worker = null;
-        showToast('Modo compatible activado: se procesa sin worker.');
-        runDetection();
+        // Si el usuario ya hizo "Quitar" (sourceImage es null), no re-procesar
+        // ni re-anunciar por audio un conteo que fue cancelado.
+        if (sourceImage) {
+          showToast('Modo compatible activado: se procesa sin worker.');
+          runDetection();
+        }
       };
     } catch (err) {
       worker = null;

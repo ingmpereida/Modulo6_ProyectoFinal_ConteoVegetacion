@@ -54,7 +54,8 @@ Aplicación de **un solo archivo HTML** (CSS + JS embebidos), en español, sin d
    - **Tamaño mínimo**: píxeles mínimos de una mancha para contarla (default 14 px, ahora en píxeles **de la imagen real**, no del preview).
    - **Separar grupos unidos**: toggle que estima varias plantas dentro de una mancha grande.
 4. Los `readouts` muestran: plantas detectadas, manchas analizadas y % de cobertura verde.
-5. **Descargar imagen marcada**: exporta la imagen **original completa** (no el preview) con los círculos dibujados.
+5. Al terminar el conteo, la app **lee en voz alta** los resultados con la API `speechSynthesis` del navegador (toggle "Audio al finalizar" en la barra lateral, activado por defecto) — sin servidor ni dependencias.
+6. **Descargar imagen marcada**: exporta la imagen **original completa** (no el preview) con los círculos dibujados.
 
 ### Algoritmo de detección
 
@@ -78,6 +79,7 @@ Los marcadores se guardan en **coordenadas de la imagen original**; el dibujo lo
 | **Fallback automático** | Si el worker falla (`onerror`), se desactiva y se vuelve a procesar inline. El usuario nunca queda colgado. |
 | **Descarga con `toBlob` + JPEG (0.95)** | `toDataURL('image/png')` genera una cadena base64 gigante que revienta la memoria en fotos grandes y falla en silencio. `toBlob` + `URL.createObjectURL` es el patrón robusto; JPEG pesa ~5–10 % del PNG. Fallback PNG para navegadores viejos. |
 | **Evento `change` (no `input`) en sliders** | Recalcula al soltar el control, no en cada tick — evita disparar procesamiento en cascada inútil. |
+| **Audio automático de resultados (SpeechSynthesis)** | Al finalizar cada conteo lee en voz alta plantas detectadas, manchas analizadas y % de cobertura. Voz `es-ES`; el porcentaje se dice como "34,5 por ciento" (coma decimal). `synth.cancel()` evita frases encoladas y el `speak()` se difiere 60 ms (quirk de Chromium: descarta una utterance si `speak()` es sincrónico tras `cancel()`), descartándose si llegó un conteo más nuevo; el guard `lastSpokenSeq` impide repetir el mismo resultado. Toggle "Audio al finalizar" (default ON). El navegador exige una primera interacción del usuario — el clic para subir la imagen ya la habilita. |
 
 ### Limitaciones conocidas (Fase 1)
 
@@ -482,6 +484,7 @@ Foto de dron (celular/dron/ortomosaico)
 2. Subir una foto con vegetación → verificar conteo, manchas y % de cobertura.
 3. Mover sliders y soltar → debe recalcular sin congelar la página (camino worker para imágenes grandes).
 4. Descargar → verificar que la imagen resultante tiene las dimensiones originales y los marcadores.
+5. Al finalizar el conteo debe oírse el resumen en voz alta; el toggle "Audio al finalizar" lo activa/desactiva.
 
 ### Verificación de sintaxis del JS embebido (Windows/PowerShell + node)
 
@@ -501,6 +504,8 @@ npm test      # equivalente a: node --test
 ```
 
 El archivo `tests/computeDetection.test.js` cubre: blob aislado, filtro `minSize`, dos blobs separados, blob pegado al borde, imagen sin verde, `splitClusters` (28 marcadores para la imagen de prueba) y determinismo de la mediana.
+
+`tests/speakResults.test.js` cubre la frase hablada al finalizar el conteo (`buildResultSpeech`): texto exacto del resumen en español ("34,5 por ciento" con coma decimal), caso cero detecciones y fallback para porcentaje no numérico ("sin dato").
 
 > Sugerencia para una IA futura: si `computeDetection` deja de pasar estos tests, el problema está en la lógica compartida del conteo — no dupliques la lógica en el worker para "arreglar" el test.
 
@@ -538,6 +543,7 @@ python3 tile_pipeline.py --input ./fotos_dron --output ./tiles
 | **CSS profesional (auditoría de UI/UX)** | Cierre de huecos detectados en revisión del CSS: slider estilizado para Firefox (`::-moz-range-track/thumb`), todos los colores pasaron a tokens (`--sand`, `--sand-tint`, `--switch-off`, `--sage-bright`, `--warn-*`, `--danger` ya existía; queda literal solo `#fff`), `prefers-reduced-motion` para desactivar animaciones, `color-scheme: light` (evita estilos oscuros de UA en controles nativos), `-webkit-tap-highlight-color` transparente en móvil, `aria-hidden="true"` en las 4 SVGs decorativas (incluida la del template de `buildStage`), selector `.readout` duplicado unificado, y en ≤860 px el resultado pasa primero (`order:-1`) con header apilado. Verificado: llaves CSS balanceadas, `node --check` OK, 8/8 tests. |
 | **Módulo 4 — `infer.py`** (cambio `yolo-inference`) | Motor de conteo con modelo entrenado como CLI de Python: `load_model` es el único seam a ultralytics (import diferido dentro de la función, NFR-1) y el resto de la pipeline consume el duck-type `predict(image) -> [Box]` — todo corre en CPU sin runtime. `main()`/argparse (FR-1): `--weights` (existente y legible, exit 2 si no), `--input` (directorio con `manifest.csv` + `tiles/` o foto única), `--output`, `--conf` 0.25, `--iou` 0.5, `--summary`, `--verbose`; salidas 0/1/2, nada se escribe ante error (NFR-6, validate-then-write). Dedup por proyección global + IoU NMS determinista (sin RNG); CSV byte-idéntico entre corridas (NFR-3). Tests: 8 subprocess con paquete `ultralytics` falso en PYTHONPATH + unit del adapter. No es IA en el navegador: la app HTML mantiene su conteo clásico. |
 | **Piloto real D8 — Roboflow → entrenamiento → conteo** (2026-09-24) | Se validó el seam completo de `infer.py` contra el runtime real: 6 tiles etiquetados en Roboflow (clase `plant`, proyecto `conteovegetacion`), versión 1 generada y exportada en `yolov8`, labels convertidos de polígono a bbox con `convert_polygon_to_bbox.py` (nuevo script versionado), `prepare_dataset.py` → `datasets/dataset` (5 train / 1 valid), `train.py --epochs 30` en CPU → `best.pt` (mAP50 ≈ 0 — esperado con 5 imágenes), `infer.py --weights best.pt` → CSV con 0 detecciones, exit 0. Resultado: el **hito D8 quedó cerrado** (el código funciona contra ultralytics real); el modelo no generaliza por falta de datos (Módulo 5.11). Documentado todo en Módulo 5. |
+| **Audio automático de resultados (F1)** | `buildResultSpeech()` (pura) genera la frase y `speakResults()` la lee con `speechSynthesis` (es-ES) al finalizar cada conteo: "Conteo de vegetación finalizado. Plantas detectadas: N. Manchas analizadas: N. Porcentaje de cobertura verde: X por ciento." Toggle "Audio al finalizar" en la barra lateral (default ON), `synth.cancel()` contra frases encoladas, speak diferido 60 ms (quirk de Chromium) con guard de frescura `detectionSeq`, `lastSpokenSeq` para no repetir el mismo resultado, y `worker.onerror` ya no re-procesa si el usuario hizo "Quitar" (además "Quitar" corta el audio en curso con `speechSynthesis.cancel()`). Se invoca desde `applyDetection()` (todo camino: foto nueva, recálculo, sliders). Verificado con `node --check` y `tests/speakResults.test.js` (12/12 en `npm test`). |
 
 ## Relación con la memoria persistente (Engram)
 

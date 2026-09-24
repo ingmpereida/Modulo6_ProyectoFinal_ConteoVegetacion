@@ -34,7 +34,7 @@ El proyecto construye un sistema de visión por computadora para **contar planta
 
 ### 3.1 Qué es
 
-Aplicación de **un solo archivo HTML** (CSS + JS embebidos), en español, sin dependencias externas. Se abre con doble clic desde el escritorio (**no requiere servidor**); la imagen nunca sale del navegador.
+Aplicación de **un solo archivo HTML** (CSS + JS embebidos), en español, sin dependencias externas. Se abre con doble clic desde el escritorio (**no requiere servidor**); la imagen nunca sale del navegador. Al terminar cada conteo, lee los resultados en voz alta con la API `speechSynthesis` del navegador (voz en español), sin servidor ni dependencias.
 
 ### 3.2 Algoritmo de detección — `computeDetection(w, h, data, threshold, minSize, splitClusters)`
 
@@ -55,6 +55,7 @@ Función **pura** (mismos inputs ⇒ mismos outputs, sin estado) que vive en el 
 | **Fallback automático** | Si el worker falla (`onerror`), se desactiva y se vuelve a procesar inline — el usuario nunca queda colgado. |
 | **Descarga robusta** | `toBlob` + JPEG 0.95 + `URL.createObjectURL`: `toDataURL('image/png')` genera base64 gigante que revienta la memoria en fotos grandes. Fallback PNG para navegadores viejos. |
 | **Evento `change` en sliders** | Recalcula al soltar el control, no en cada tick — evita procesamiento en cascada. |
+| **Audio automático de resultados** | `buildResultSpeech()` (pura, testeable sin DOM) genera la frase y `speakResults()` la lee con `speechSynthesis` (es-ES): al finalizar el conteo lee plantas detectadas, manchas analizadas y % de cobertura ("34,5 por ciento" — coma decimal, más natural al hablar). `synth.cancel()` evita frases encoladas y el `speak()` se difiere 60 ms (quirk de Chromium que descarta utterances llamadas sincrónicamente tras `cancel()`), con guard de frescura `seq !== detectionSeq`; `lastSpokenSeq` evita repetir el mismo resultado. Toggle "Audio al finalizar" en la barra lateral (default ON, `aria-label` accesible). Requiere una primera interacción del usuario para habilitar audio — el clic para subir la imagen ya la habilita. |
 | **UI/UX v2** | Spinner "analizando a resolución completa…", metadatos de imagen cargada, guía contextual cuando no hay detecciones, toasts accesibles (`role="status"`), tokens de color CSS, `prefers-reduced-motion`, CSS profesional con auditoría (ver README). |
 
 ### 3.4 Limitaciones conocidas (F1)
@@ -66,6 +67,8 @@ Función **pura** (mismos inputs ⇒ mismos outputs, sin estado) que vive en el 
 ### 3.5 Tests
 
 `tests/computeDetection.test.js` — 8 casos sobre el runner **nativo de Node** (`node:test`, `npm test`): blob aislado, filtro `minSize`, dos blobs separados, blob pegado al borde, imagen sin verde, `splitClusters`, determinismo de la mediana. Extrae la función del HTML contando llaves (misma técnica que usa la app para el worker).
+
+`tests/speakResults.test.js` — 4 casos sobre la frase hablada (`buildResultSpeech`): texto exacto del resumen en español con coma decimal ("34,5 por ciento"), caso cero detecciones y fallback "sin dato" para porcentaje no numérico. Verifica el contrato de claridad del audio sin tocar el DOM.
 
 ---
 
@@ -312,7 +315,7 @@ Foto de dron (celular/dron/ortomosaico)
 | Ámbito | Detalle |
 |---|---|
 | **Tests Python** | `pytest tests/ -q` → **150 passed** (incluye suite subprocess del CLI) |
-| **Tests Node** | `npm test` → **8/8** (`computeDetection`) |
+| **Tests Node** | `npm test` → **12/12** (`computeDetection` 8 + `buildResultSpeech` 4) |
 | **TDD estricto** | Activado vía SDD: tests primero, luego implementación, por cambio |
 | **Reviews aplicadas** | Cadena de PRs revisada con lentes `review-reliability` (gate), `review-risk`, `review-resilience`, `review-readability`. Hallazgos clave corregidos: R4-001 (boxes=None abortaba batch), R1-001 (path traversal en tiles), R1-004/R4-003 (escritura no atómica), R4-002 (manifest vacío silencioso), R2-001/002/004 (docstring, test duplicado, clase 0). Won't-fix documentados: R1-002 (`.pt` = pickle/RCE — solo pesos de fuentes confiables), R1-003 (inyección de fórmulas CSV — solo self-injection). |
 | **Re-verificación final** | Ledger de review persistido; re-review scoped: 7/7 hallazgos verificados, 0 nuevos problemas |
@@ -327,7 +330,7 @@ Foto de dron (celular/dron/ortomosaico)
 
 ## 10. Estado actual y próximos pasos
 
-**Hecho:** fases 1–3, tests, reviews, piloto real (D8), documentación (README Módulos 1–5, este reporte).
+**Hecho:** fases 1–3, tests, reviews, piloto real (D8), documentación (README Módulos 1–5, este reporte), audio automático de resultados en la app HTML (F1).
 
 **Pendiente / recomendado:**
 1. **Recolectar y etiquetar dataset grande** (Módulo 5.11): 3–4 vuelos × 5–8 fotos × 4–6 tiles ≈ 100–200 tiles para la primera iteración que aprenda.
