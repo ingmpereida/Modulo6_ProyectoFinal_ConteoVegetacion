@@ -18,6 +18,7 @@ Este README está escrito para que **una IA o una persona pueda entender el proy
 | `README.md` | Este documento | — |
 | `prepare_dataset.py` | Fase 2–3 — build del dataset YOLO: split por vuelo + `data.yaml` | Hecho (PR2) |
 | `train.py` | Fase 2–3 — entrenamiento YOLO26: train + val + métricas mAP | Hecho (PR3) |
+| `infer.py` | Fase 3 — conteo con modelo entrenado: CLI determinista + CSV con dedup NMS (Módulo 4) | Hecho (cambio `yolo-inference`) |
 
 El repositorio **git** se inicializó con el PR1 del cambio `yolo-training-pipeline` (rama `feat/yolo-pr1-repo`, base de la cadena `feat/yolo-training-pipeline`, commits convencionales); `.gitignore` excluye artefactos generados (`runs/`, `datasets/`, venv, caches, `node_modules/`). La lógica de detección sí tiene tests automatizados — ver *Tests automatizados*.
 
@@ -26,15 +27,16 @@ El repositorio **git** se inicializó con el PR1 del cambio `yolo-training-pipel
 ## Pipeline global (fases del proyecto)
 
 ```
-Fase 1 (hecha)        Fase 2 (hecha)              Fase 2–3 (hecha)
-Fotos de dron     ->  Cortar en tiles          ->  Dataset YOLO (por vuelo)
-conteo clásico        descartar tiles vacíos       entrenar YOLO26 + val mAP
-por color             generar manifest.csv         conteo con mayor precisión
+Fase 1 (hecha)        Fase 2 (hecha)              Fase 2–3 (hecha)          Fase 3 (hecha)
+Fotos de dron     ->  Cortar en tiles          ->  Dataset YOLO (por vuelo) -> Conteo con el modelo
+conteo clásico        descartar tiles vacíos       entrenar YOLO26 + val     entrenado (infer.py,
+por color             generar manifest.csv         mAP                      Módulo 4)
 ```
 
 - **Fase 1**: `conteo_vegetacion.html` — conteo por color (Excess Green Index) + componentes conexas. Prototipo interactivo.
 - **Fase 2**: `tile_pipeline.py` — convierte fotos grandes en tiles etiquetables, descartando suelo vacío.
 - **Fase 2–3 (hecha)**: `prepare_dataset.py` convierte tiles + etiquetas YOLO en un dataset con split por vuelo; `train.py` entrena YOLO26 y reporta mAP50/mAP50-95 (ver Módulo 3).
+- **Fase 3 (hecha)**: `infer.py` cuenta plantas en fotos con un modelo entrenado, deduplicando por IoU en coordenadas globales (ver Módulo 4). Pendiente: correr un entrenamiento real con datos etiquetados de las parcelas.
 
 ---
 
@@ -229,6 +231,74 @@ Flujo: carga el modelo, entrena (`model.train(...)`), valida (`model.val()`) e i
 
 ---
 
+## Módulo 4 — `infer.py` (Fase 3, conteo con modelo entrenado)
+
+CLI que cuenta plantas en fotos de dron usando el modelo entrenado en el Módulo 3 y los tiles + `manifest.csv` de la Fase 2 (Módulo 2). Es **determinista** (NFR-3): mismas entradas y flags ⇒ mismo CSV byte a byte — sin timestamps, rutas absolutas ni RNG en la salida.
+
+> ⚠️ **Qué es y qué no es**: el motor de conteo con IA es **una herramienta CLI de Python**, NO IA dentro del navegador. El HTML `conteo_vegetacion.html` conserva su conteo clásico por color; `infer.py` es la vía con modelo entrenado, separada de la app web (non-goal: integración ONNX/Web fuera de alcance).
+
+### Uso
+
+```bash
+# Modo directorio (salida de tile_pipeline.py: manifest.csv + tiles/)
+python infer.py --weights runs/train/exp/weights/best.pt \
+    --input ./input_tiles --output counts.csv
+
+# Modo foto única (sin manifest, deduplicación desactivada)
+python infer.py --weights runs/train/exp/weights/best.pt \
+    --input DJI_0001.JPG --output counts.csv
+
+# Con resumen por vuelo y progreso detallado
+python infer.py --weights runs/train/exp/weights/best.pt \
+    --input ./input_tiles --output counts.csv --summary --verbose
+```
+
+### Parámetros CLI
+
+| Parámetro | Default | Descripción |
+|---|---|---|
+| `--weights` | (requerido) | Pesos entrenados `.pt` (ej. `runs/train/exp/weights/best.pt`). Debe existir y ser un archivo legible; si no → código 2 |
+| `--input` | (requerido) | Carpeta con `manifest.csv` + `tiles/` (layout de tile_pipeline.py) **o** una foto JPG/PNG/TIF suelta |
+| `--output` | (requerido) | Ruta del CSV de salida. Se escribe SOLO si todas las fotos se procesan bien (NFR-6) |
+| `--conf` | 0.25 | Confianza mínima de detección, en el intervalo abierto (0, 1) |
+| `--iou` | 0.5 | Umbral IoU del NMS global, en el intervalo abierto (0, 1) |
+| `--summary` | off | Imprime totales por vuelo en stdout; NO altera el CSV |
+| `--verbose` | off | Imprime una línea de progreso por foto |
+
+### Layout de entrada (modo directorio)
+
+```
+input_tiles/
+  manifest.csv              ← generado por tile_pipeline.py (Módulo 2)
+  tiles/
+    ParcelaA_2026-09-10_emergencia/
+      DJI_0001_x00000_y00000.jpg
+      ...
+```
+
+Modo foto única: se pasa directamente el archivo de imagen (sin manifest). Ahí no hay offsets contra los cuales deduplicar, así que el conteo omite el NMS (`dedup_removed = 0`, `box_count = global_count`) y la fila del CSV usa `flight = photo = nombre base` (D6).
+
+### Códigos de salida
+
+| Código | Significado |
+|---|---|
+| `0` | Éxito: CSV escrito |
+| `1` | Error de datos/procesamiento — **nada se escribe**: falta `manifest.csv`, un tile referenciado no existe, pesos corruptos pero legibles, fallo a mitad de corrida |
+| `2` | Uso inválido (argparse): faltan argumentos, `--weights` inexistente/no legible, `--conf`/`--iou` fuera de (0, 1), `--input` inexistente |
+
+### Por qué la deduplicación (y qué hace el NMS)
+
+El traslape entre tiles (Módulo 2) hace que una misma planta aparezca en tiles adyacentes. `infer.py` no suma detecciones por tile como si fueran plantas distintas: proyecta cada detección a **coordenadas globales de la foto** (desplazando por `x_offset`/`y_offset` del manifest), recorta las que quedan parcialmente fuera de la foto, y luego aplica **IoU NMS por foto**:
+
+- Se ordenan las cajas por confianza descendente (empates: orden de aparición — determinista, sin RNG).
+- Se conserva una caja si su IoU con TODAS las ya conservadas es `< --iou` (default 0.5); si IoU `≥ 0.5` se considera la misma planta y se descarta.
+- `global_count` = cajas conservadas; `box_count` = detecciones que pasaron el filtro de clase+confianza; `dedup_removed = box_count − global_count`.
+- `source_tiles` = lista ordenada de los tiles que aportaron detecciones al pool pre-dedup de la foto (aunque todas sus cajas hayan sido suprimidas por NMS — semantic: los dos tiles de una planta duplicada aparecen listados, FR-4).
+
+El CSV usa el header exacto `flight,photo,global_count,box_count,dedup_removed,source_tiles`, una fila por foto, ordenadas por `(flight, photo)`.
+
+---
+
 ## Flujo de datos completo (cómo encajan las piezas)
 
 ```
@@ -240,7 +310,11 @@ Foto de dron (celular/dron/ortomosaico)
   └─► Fase 2: tile_pipeline.py (preparación para ML)
         fotos → tiles etiquetables + manifest.csv
         → etiquetas YOLO (sidecars .txt) → prepare_dataset.py → train.py
-        → modelo entrenado (mAP en consola) → Fase 1 con IA
+        → modelo entrenado (mAP en consola) → infer.py (Módulo 4)
+        → counts.csv (conteo por foto y por vuelo)
+
+> Nota de alcance: el conteo con IA (`infer.py`) es un CLI de Python; la app
+> HTML `conteo_vegetacion.html` sigue con su camino clásico por color (Fase 1).
 ```
 
 ---
@@ -304,7 +378,8 @@ python3 tile_pipeline.py --input ./fotos_dron --output ./tiles
 
 1. ~~Inicializar **git** (repo + commits conventionales) y añadir `.gitignore`.~~ — **hecho** en el PR1 del cambio `yolo-training-pipeline`.
 2. **Fase 2–3** (cambio `yolo-training-pipeline`): ~~etiquetar tiles en Roboflow/CVAT usando el `manifest.csv`; `prepare_dataset.py` con split por vuelo y `data.yaml` (PR2) y `train.py` con YOLO26 + validación (PR3)~~ — **hecho**: ver Módulo 3; queda pendiente etiquetar datos reales y correr el primer entrenamiento.
-3. Optimización opcional: `OffscreenCanvas` dentro del worker para evitar el `getImageData`/transferencia en el hilo principal.
+3. **Fase 3** (cambio `yolo-inference`): ~~`infer.py` — CLI determinista de conteo con modelo entrenado, dedup por IoU global, modos directorio/foto única, exit codes 0/1/2~~ — **hecho**: ver Módulo 4. Una vez existan pesos reales (punto 2), correr `python infer.py --weights runs/train/exp/weights/best.pt --input <carpeta con manifest.csv + tiles/> --output counts.csv`.
+4. Optimización opcional: `OffscreenCanvas` dentro del worker para evitar el `getImageData`/transferencia en el hilo principal.
 
 ---
 
@@ -319,6 +394,7 @@ python3 tile_pipeline.py --input ./fotos_dron --output ./tiles
 | **Fix `--min-detail` + tests automatizados** | Corregida la referencia al parámetro en el mensaje final de `tile_pipeline.py`. Nuevo `tests/computeDetection.test.js` (8 casos sobre el runner nativo de Node, `npm test`) y `package.json` mínimo. |
 | **UI/UX v2** | Feedback de procesamiento (botón con spinner y badge "analizando a resolución completa…" con anillo), metadatos de la imagen cargada (nombre + dimensiones, deja claro que se procesa la original), guía contextual cuando no se detectan plantas (sugiere bajar Índice de verdor o Tamaño mínimo), toasts con `role="status"` (descarga exitosa, archivo inválido, fallback sin worker), accesibilidad (`aria-live="polite"` en los readouts), micro-interacciones (pulse del contador, hover con sombra en la zona de subida) y ajustes para pantallas ≤ 480 px. |
 | **CSS profesional (auditoría de UI/UX)** | Cierre de huecos detectados en revisión del CSS: slider estilizado para Firefox (`::-moz-range-track/thumb`), todos los colores pasaron a tokens (`--sand`, `--sand-tint`, `--switch-off`, `--sage-bright`, `--warn-*`, `--danger` ya existía; queda literal solo `#fff`), `prefers-reduced-motion` para desactivar animaciones, `color-scheme: light` (evita estilos oscuros de UA en controles nativos), `-webkit-tap-highlight-color` transparente en móvil, `aria-hidden="true"` en las 4 SVGs decorativas (incluida la del template de `buildStage`), selector `.readout` duplicado unificado, y en ≤860 px el resultado pasa primero (`order:-1`) con header apilado. Verificado: llaves CSS balanceadas, `node --check` OK, 8/8 tests. |
+| **Módulo 4 — `infer.py`** (cambio `yolo-inference`) | Motor de conteo con modelo entrenado como CLI de Python: `load_model` es el único seam a ultralytics (import diferido dentro de la función, NFR-1) y el resto de la pipeline consume el duck-type `predict(image) -> [Box]` — todo corre en CPU sin runtime. `main()`/argparse (FR-1): `--weights` (existente y legible, exit 2 si no), `--input` (directorio con `manifest.csv` + `tiles/` o foto única), `--output`, `--conf` 0.25, `--iou` 0.5, `--summary`, `--verbose`; salidas 0/1/2, nada se escribe ante error (NFR-6, validate-then-write). Dedup por proyección global + IoU NMS determinista (sin RNG); CSV byte-idéntico entre corridas (NFR-3). Tests: 8 subprocess con paquete `ultralytics` falso en PYTHONPATH + unit del adapter. No es IA en el navegador: la app HTML mantiene su conteo clásico. |
 
 ## Relación con la memoria persistente (Engram)
 
