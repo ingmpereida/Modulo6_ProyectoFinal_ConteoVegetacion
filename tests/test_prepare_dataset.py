@@ -350,6 +350,131 @@ class TestWriteLayout:
         assert yaml_a["val"] == yaml_b["val"] == "images/valid"
 
 
+# ---------------------------------------------------------------------------
+# FR-4: CLI contract
+# ---------------------------------------------------------------------------
+
+
+class TestCli:
+    def test_missing_required_args_exit_with_code_2(self, three_flights):
+        manifest, labels_root = three_flights
+        with pytest.raises(SystemExit) as exc:
+            pd.main(["--labels", str(labels_root), "--output", str(manifest)])
+        assert exc.value.code == 2
+
+    def test_missing_manifest_file_returns_1_and_writes_nothing(self, tmp_path):
+        output = tmp_path / "out"
+
+        rc = pd.main(
+            [
+                "--manifest", str(tmp_path / "nope.csv"),
+                "--labels", str(tmp_path),
+                "--output", str(output),
+            ]
+        )
+
+        assert rc == 1
+        assert not output.exists()
+
+    def test_bad_valid_ratio_returns_2_and_writes_nothing(self, three_flights, tmp_path):
+        manifest, labels_root = three_flights
+        output = tmp_path / "out"
+
+        rc = pd.main(
+            [
+                "--manifest", str(manifest),
+                "--labels", str(labels_root),
+                "--output", str(output),
+                "--valid-ratio", "1.5",
+            ]
+        )
+
+        assert rc == 2
+        assert not output.exists()
+
+    def test_valid_ratio_zero_returns_2(self, three_flights, tmp_path):
+        manifest, labels_root = three_flights
+        output = tmp_path / "out"
+
+        rc = pd.main(
+            [
+                "--manifest", str(manifest),
+                "--labels", str(labels_root),
+                "--output", str(output),
+                "--valid-ratio", "0",
+            ]
+        )
+
+        assert rc == 2
+        assert not output.exists()
+
+    def test_valid_run_returns_0_and_creates_layout(self, three_flights, tmp_path):
+        manifest, labels_root = three_flights
+        output = tmp_path / "out"
+
+        rc = pd.main(
+            [
+                "--manifest", str(manifest),
+                "--labels", str(labels_root),
+                "--output", str(output),
+            ]
+        )
+
+        assert rc == 0
+        assert (output / "data.yaml").is_file()
+        assert len(list((output / "images" / "train").glob("*.jpg"))) == 13
+        assert len(list((output / "images" / "valid").glob("*.jpg"))) == 3
+
+    def test_missing_image_returns_1_without_partial_output(self, three_flights, tmp_path):
+        manifest, labels_root = three_flights
+        (labels_root / "ParcelaA_2026-09-10_emergencia" / "DJI_0001_x00000_y00000.jpg").unlink()
+        output = tmp_path / "out"
+
+        rc = pd.main(
+            [
+                "--manifest", str(manifest),
+                "--labels", str(labels_root),
+                "--output", str(output),
+            ]
+        )
+
+        assert rc == 1
+        assert not output.exists()
+
+    def test_malformed_sidecar_returns_1_without_partial_output(self, tmp_path, make_flight_layout):
+        labels = {"t.jpg": "0 0.5 0.5 0.2 0.2\n", "bad.jpg": "0 0.5\n"}
+        manifest, labels_root = make_flight_layout({"A": labels})
+        output = tmp_path / "out"
+
+        rc = pd.main(
+            [
+                "--manifest", str(manifest),
+                "--labels", str(labels_root),
+                "--output", str(output),
+            ]
+        )
+
+        assert rc == 1
+        assert not output.exists()
+
+    def test_rerun_same_seed_produces_identical_tree(self, three_flights, tmp_path):
+        manifest, labels_root = three_flights
+        output = tmp_path / "out"
+        args = [
+            "--manifest", str(manifest),
+            "--labels", str(labels_root),
+            "--output", str(output),
+            "--seed", "42",
+        ]
+
+        assert pd.main(args) == 0
+        first = _file_tree(output)
+        assert pd.main(args) == 0
+        second = _file_tree(output)
+
+        assert first == second
+
+
 def _file_tree(root: Path) -> dict:
     """Relative path -> bytes for every file under root (deterministic order)."""
     return {
