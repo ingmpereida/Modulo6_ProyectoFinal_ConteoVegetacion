@@ -1,0 +1,9 @@
+{
+  "name": "conteo-vegetacion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Conteo de vegetacion con IA — tests automatizados",
+  "scripts": {
+    "test": "node --test"
+  }
+}

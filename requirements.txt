@@ -1,0 +1,4 @@
+# Dependencias Python de tile_pipeline.py (Fase 2 - preparacion de tiles)
+# Instalar con: pip install -r requirements.txt
+Pillow>=10.0
+numpy>=1.26
