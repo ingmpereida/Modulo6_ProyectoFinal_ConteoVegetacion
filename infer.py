@@ -195,18 +195,29 @@ def read_tiles(manifest_path: Path, tiles_root: Path) -> list[TileSpec]:
     x_offset, y_offset, tile_w, tile_h, imagen_ancho, imagen_alto. Each tile
     resolves to ``tiles_root / vuelo / tile``; a manifest that references a
     missing tile image raises FileNotFoundError (the CLI maps it to exit 1).
+    Tile paths are CONFINED to the tiles root (R1-001): every tile is
+    resolved and must stay under ``tiles_root`` — a crafted ``..`` or
+    absolute component that would escape the root raises FileNotFoundError
+    naming the offending row/tile.
     """
     tiles: list[TileSpec] = []
+    root_resolved = Path(tiles_root).resolve()
     with Path(manifest_path).open("r", newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
-            tile_path = tiles_root / row["vuelo"] / row["tile"]
-            if not tile_path.is_file():
+        for row_no, row in enumerate(csv.DictReader(fh), start=2):  # header is line 1
+            tile_path = root_resolved / row["vuelo"] / row["tile"]
+            tile_resolved = tile_path.resolve()
+            if not tile_resolved.is_relative_to(root_resolved):
                 raise FileNotFoundError(
-                    f"manifest references missing tile image: {tile_path}"
+                    f"manifest row {row_no} tile {row['tile']!r} escapes the "
+                    f"tiles root: {tile_resolved} (expected under {root_resolved})"
+                )
+            if not tile_resolved.is_file():
+                raise FileNotFoundError(
+                    f"manifest references missing tile image: {tile_resolved}"
                 )
             tiles.append(
                 TileSpec(
-                    path=tile_path,
+                    path=tile_resolved,
                     flight=row["vuelo"],
                     photo=row["imagen_origen"],
                     x_offset=int(row["x_offset"]),

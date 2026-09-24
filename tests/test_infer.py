@@ -499,6 +499,44 @@ class TestReadTiles:
         )
         assert infer.read_tiles(manifest, tmp_path / "tiles") == []
 
+    def test_tile_escaping_the_tiles_root_raises(self, tmp_path):
+        # R1-001: a crafted manifest row whose tile path escapes tiles_root
+        # (here via `..` from the flight dir — tiles/F1/../../outside.png
+        # normalizes to the root's parent) must be rejected with a clear
+        # error, not read from outside the root.
+        root = tmp_path / "tiles"
+        root.mkdir()
+        manifest = tmp_path / "manifest.csv"
+        manifest.write_text(
+            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
+            "imagen_ancho,imagen_alto\n"
+            "F1,DJI_0001.JPG,../../outside.png,0,0,640,640,1280,800\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(FileNotFoundError, match="escapes"):
+            infer.read_tiles(manifest, root)
+
+    def test_absolute_flight_component_escaping_the_tiles_root_raises(
+        self, tmp_path,
+    ):
+        # R1-001 triangulation: a flight component of "."-style ("..") walks
+        # OUT of tiles_root once resolved — must fail confinement too.
+        root = tmp_path / "tiles"
+        root.mkdir()
+        manifest = tmp_path / "manifest.csv"
+        manifest.write_text(
+            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
+            "imagen_ancho,imagen_alto\n"
+            "..,DJI_0001.JPG,evil.png,0,0,640,640,1280,800\n",
+            encoding="utf-8",
+        )
+        # flight ".." resolves to tmp_path/evil.png, i.e. NOT under
+        # tmp_path/tiles — the tile escapes the tiles root.
+        escape = tmp_path / "evil.png"
+        escape.write_bytes(b"x")
+        with pytest.raises(FileNotFoundError, match="escapes"):
+            infer.read_tiles(manifest, root)
+
 
 # ---------------------------------------------------------------------------
 # PR2 2.5: count_photo — per-photo pipeline (load->predict->filter->project->
@@ -1152,6 +1190,34 @@ class TestMainRun:
         )
         assert rc == 1
         assert out.read_text(encoding="utf-8") == "sentinel\n"
+
+    def test_escaping_tile_manifest_exits_1_and_writes_nothing(
+        self, tmp_path, capsys
+    ):
+        # R1-001: directory mode with a manifest whose tile escapes the tiles
+        # root -> exit 1 with a clear stderr message, nothing written.
+        (tmp_path / "tiles").mkdir()
+        (tmp_path / "manifest.csv").write_text(
+            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
+            "imagen_ancho,imagen_alto\n"
+            "F1,DJI_0001.JPG,../../outside.png,0,0,640,640,1280,800\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        out = tmp_path / "counts.csv"
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 1
+        assert not out.exists()
+        assert "escapes" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
