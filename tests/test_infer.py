@@ -90,3 +90,59 @@ class TestFilterBoxes:
     def test_no_detections_yields_empty_result(self):
         kept = infer.filter_boxes([], 0.25)
         assert kept == []
+
+
+# ---------------------------------------------------------------------------
+# PR1 1.2: project_box — pure offset translation into photo space
+# ---------------------------------------------------------------------------
+
+
+class TestProjectBox:
+    def test_x_offset_shifts_all_coordinates(self):
+        box = infer.Box((0.0, 0.0, 320.0, 320.0), 0.8, 0)
+        projected = infer.project_box(box, 544, 0)
+        assert projected.xyxy == (544.0, 0.0, 864.0, 320.0)
+
+    def test_x_and_y_offsets_and_negative_shifts(self):
+        box = infer.Box((100.0, 200.0, 300.0, 400.0), 0.6, 0)
+        projected = infer.project_box(box, -50, -25)
+        assert projected.xyxy == (50.0, 175.0, 250.0, 375.0)
+
+    def test_metadata_passes_through_untouched(self):
+        box = infer.Box((1.0, 2.0, 3.0, 4.0), 0.95, 0)
+        projected = infer.project_box(box, 1000, 500)
+        assert projected.conf == 0.95
+        assert projected.cls == 0
+
+
+# ---------------------------------------------------------------------------
+# PR1 1.3: clip_box — clip partial boxes to photo bounds, discard outside
+# ---------------------------------------------------------------------------
+
+
+class TestClipBox:
+    def test_inside_box_is_untouched(self):
+        box = infer.Box((100.0, 50.0, 300.0, 250.0), 0.7, 0)
+        clipped = infer.clip_box(box, 4000, 3000)
+        assert clipped == box
+
+    def test_border_partial_box_is_clipped_to_photo_bounds(self):
+        box = infer.Box((-100.0, 0.0, 100.0, 320.0), 0.7, 0)
+        clipped = infer.clip_box(box, 4000, 3000)
+        assert clipped is not None
+        assert clipped.xyxy == (0.0, 0.0, 100.0, 320.0)
+        assert clipped.conf == 0.7
+        assert clipped.cls == 0
+
+    def test_box_sticking_out_bottom_is_clipped(self):
+        box = infer.Box((0.0, 2900.0, 200.0, 3100.0), 0.7, 0)
+        clipped = infer.clip_box(box, 4000, 3000)
+        assert clipped.xyxy == (0.0, 2900.0, 200.0, 3000.0)
+
+    def test_fully_outside_right_is_discarded(self):
+        box = infer.Box((4100.0, 0.0, 4200.0, 100.0), 0.7, 0)
+        assert infer.clip_box(box, 4000, 3000) is None
+
+    def test_fully_outside_left_is_discarded(self):
+        box = infer.Box((-200.0, 0.0, -50.0, 100.0), 0.7, 0)
+        assert infer.clip_box(box, 4000, 3000) is None

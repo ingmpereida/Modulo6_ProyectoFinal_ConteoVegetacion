@@ -12,7 +12,7 @@ and argparse CLI arrive in PR2/PR3.
 from dataclasses import dataclass
 
 
-__all__ = ["Box", "filter_boxes"]
+__all__ = ["Box", "filter_boxes", "project_box", "clip_box"]
 
 
 @dataclass(frozen=True)
@@ -40,3 +40,30 @@ def filter_boxes(boxes: list[dict], conf: float, cls: int = 0) -> list[Box]:
         if raw["cls"] == cls and raw["conf"] >= conf:
             kept.append(Box(tuple(raw["xyxy"]), raw["conf"], raw["cls"]))
     return kept
+
+
+def project_box(box: Box, x_off: int, y_off: int) -> Box:
+    """Translate a tile-pixel box into photo space by the tile's offset.
+
+    Boxes are plain pixel ``xyxy``, so projection is a pure coordinate
+    addition on all four values — no normalization math (FR-3 amended, D1).
+    Confidence and class pass through untouched.
+    """
+    x1, y1, x2, y2 = box.xyxy
+    return Box((x1 + x_off, y1 + y_off, x2 + x_off, y2 + y_off), box.conf, box.cls)
+
+
+def clip_box(box: Box, photo_w: int, photo_h: int) -> Box | None:
+    """Clip a projected box to the photo rectangle (0, 0, photo_w, photo_h).
+
+    Partially overlapping boxes are clipped to the bounds and still counted
+    (border tiles keep their plants, FR-4); boxes with no positive-area
+    overlap are fully outside the photo and discarded (design D5). ``None``
+    means the box contributes nothing.
+    """
+    x1, y1, x2, y2 = box.xyxy
+    cx1, cy1 = max(x1, 0.0), max(y1, 0.0)
+    cx2, cy2 = min(x2, float(photo_w)), min(y2, float(photo_h))
+    if cx2 <= cx1 or cy2 <= cy1:
+        return None
+    return Box((cx1, cy1, cx2, cy2), box.conf, box.cls)
