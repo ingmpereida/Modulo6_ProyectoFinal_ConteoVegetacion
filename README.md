@@ -12,11 +12,12 @@ Este README está escrito para que **una IA o una persona pueda entender el proy
 |---|---|---|
 | `conteo_vegetacion.html` | Fase 1 — prototipo de conteo clásico por color, 100 % en el navegador | Funcional, con worker |
 | `tile_pipeline.py` | Fase 2 — preparación de imágenes para etiquetado (tiles + manifest) | Funcional |
-| `requirements.txt` | Dependencias Python (`Pillow`, `numpy`) | Creado |
+| `requirements.txt` | Dependencias Python (`Pillow`, `numpy` + pipeline YOLO) | Creado |
 | `tests/computeDetection.test.js` | Test automatizado de `computeDetection` (runner nativo de Node) | 8/8 pasando |
 | `package.json` | Script `npm test` para correr los tests | — |
 | `README.md` | Este documento | — |
-| Cambio `yolo-training-pipeline` (PR1–PR3) | Fase 2–3 — pipeline de entrenamiento YOLO: `prepare_dataset.py` (split por vuelo + `data.yaml`) y `train.py` (YOLO26, train + val + métricas) sobre los tiles de la Fase 2 | PR1 (git init + `.gitignore`) hecho; PR2/PR3 pendientes |
+| `prepare_dataset.py` | Fase 2–3 — build del dataset YOLO: split por vuelo + `data.yaml` | Hecho (PR2) |
+| `train.py` | Fase 2–3 — entrenamiento YOLO26: train + val + métricas mAP | Hecho (PR3) |
 
 El repositorio **git** se inicializó con el PR1 del cambio `yolo-training-pipeline` (rama `feat/yolo-pr1-repo`, base de la cadena `feat/yolo-training-pipeline`, commits convencionales); `.gitignore` excluye artefactos generados (`runs/`, `datasets/`, venv, caches, `node_modules/`). La lógica de detección sí tiene tests automatizados — ver *Tests automatizados*.
 
@@ -25,15 +26,15 @@ El repositorio **git** se inicializó con el PR1 del cambio `yolo-training-pipel
 ## Pipeline global (fases del proyecto)
 
 ```
-Fase 1 (hecha)        Fase 2 (hecha)              Fase 2–3 (pendiente)
-Fotos de dron     ->  Cortar en tiles          ->  Etiquetar en Roboflow/CVAT
-conteo clásico        descartar tiles vacíos       entrenar modelo (YOLO/CNN)
+Fase 1 (hecha)        Fase 2 (hecha)              Fase 2–3 (hecha)
+Fotos de dron     ->  Cortar en tiles          ->  Dataset YOLO (por vuelo)
+conteo clásico        descartar tiles vacíos       entrenar YOLO26 + val mAP
 por color             generar manifest.csv         conteo con mayor precisión
 ```
 
 - **Fase 1**: `conteo_vegetacion.html` — conteo por color (Excess Green Index) + componentes conexas. Prototipo interactivo.
 - **Fase 2**: `tile_pipeline.py` — convierte fotos grandes en tiles etiquetables, descartando suelo vacío.
-- **Fase 2–3 (futura)**: las propuestas mencionan un modelo entrenado para copas solapadas y alta densidad. Los tiles de la Fase 2 alimentan exactamente ese etiquetado.
+- **Fase 2–3 (hecha)**: `prepare_dataset.py` convierte tiles + etiquetas YOLO en un dataset con split por vuelo; `train.py` entrena YOLO26 y reporta mAP50/mAP50-95 (ver Módulo 3).
 
 ---
 
@@ -164,6 +165,70 @@ tile conservado si (diff > 25).count() >= min_pixels
 
 ---
 
+## Módulo 3 — `prepare_dataset.py` y `train.py` (Fase 2–3, entrenamiento YOLO)
+
+Dos scripts convierten los tiles + etiquetas de la Fase 2 en un dataset YOLO y entrenan un detector **YOLO26 nano** (`yolo26n.pt`) para contar plantas. Requieren **Python 3.14** y `pip install -r requirements.txt` (ultralytics arrastra torch/torchvision automáticamente).
+
+### 3.1 `prepare_dataset.py` — construir el dataset
+
+```bash
+python3 prepare_dataset.py --manifest tiles/manifest.csv --labels tiles --output datasets/plantas
+```
+
+| Parámetro | Default | Descripción |
+|---|---|---|
+| `--manifest` | (requerido) | `manifest.csv` generado por `tile_pipeline.py` |
+| `--labels` | (requerido) | Raíz con carpetas por vuelo (imágenes + sidecars `.txt`) |
+| `--output` | (requerido) | Carpeta del dataset (se sobrescribe si ya existe) |
+| `--valid-ratio` | 0.2 | Fracción de validación por vuelo, en (0, 1) |
+| `--seed` | 42 | Semilla del split (mismos inputs + seed ⇒ mismo layout) |
+
+Códigos de salida: `0` éxito, `1` error de datos (**no se escribe nada**), `2` uso inválido.
+
+### 3.2 Estructura del dataset (salida)
+
+```
+datasets/plantas/
+  images/train/   labels/train/    ← tiles + sidecars de entrenamiento
+  images/valid/   labels/valid/    ← tiles + sidecars de validación
+  data.yaml                        ← path, train, val, names: [plant]
+```
+
+### 3.3 Split por vuelo — racionalidad y limitación conocida
+
+El split train/valid es **por vuelo** (80/20, nunca se cruzan tiles entre vuelos): los tiles de un mismo vuelo se traslapan (el overlap de `tile_pipeline.py`) y comparten plantas, así que un split global pondría vistas de la misma planta en train y valid al mismo tiempo (leakage) e inflaría las métricas. Regla de borde: un vuelo con 1 solo tile va completo a train y deja valid vacío.
+
+**Limitación (leakage intra-vuelo, aceptada):** dentro de un mismo vuelo, dos tiles solapados pueden caer uno en train y otro en valid, es decir, la misma planta puede verse en ambos conjuntos. Las métricas del modelo son por lo tanto **indicativas**, no una evaluación rigurosa de generalización entre vuelos; para evaluar de verdad, separar vuelos completos (train con vuelos A/B, valid con vuelo C).
+
+### 3.4 Etiquetas: sidecar faltante y archivos malformados
+
+Las etiquetas son sidecars YOLO `<tile>.txt` al lado de la imagen (formato `class x y w h`, normalizado, una caja por línea).
+
+- **Tile sin sidecar** = muestra de fondo: la imagen se copia solo a `images/…`, **nunca** a `labels/…` (`labels/` solo contiene sidecars válidos). Un sidecar vacío es una etiqueta válida "sin objetos", distinta del fondo.
+- **Sidecar malformado** (línea que no tiene 5 campos, clase no entera o coordenada no flotante) = **error duro**: el script falla con un mensaje claro y **no escribe nada** — el fallo es a propósito (fail fast), para que un dataset corrupto jamás se exporte en silencio.
+
+### 3.5 `train.py` — entrenar y validar
+
+```bash
+python3 train.py --data datasets/plantas/data.yaml --epochs 100 --imgsz 640 --batch 8
+# continuar un entrenamiento desde su último checkpoint:
+python3 train.py --data datasets/plantas/data.yaml --resume runs/train/exp/weights/last.pt
+```
+
+| Parámetro | Default | Descripción |
+|---|---|---|
+| `--data` | (requerido) | `data.yaml` generado por `prepare_dataset.py` |
+| `--weights` | `yolo26n.pt` | Pesos preentrenados (`.pt`) o un `.yaml` de arquitectura |
+| `--epochs` | 100 | Épocas de entrenamiento |
+| `--imgsz` | 640 | Tamaño de imagen de entrenamiento |
+| `--batch` | 8 | Tamaño de lote (bajo para CPU) |
+| `--project` | `runs/` | Raíz de artefactos de entrenamiento (gitignored) |
+| `--resume` | (ninguno) | Ruta a un `last.pt` para continuar |
+
+Flujo: carga el modelo, entrena (`model.train(...)`), valida (`model.val()`) e imprime `Validation metrics - mAP50 (B): x | mAP50-95 (B): y`. Pesos y métricas quedan bajo `runs/` (ignorado por git). Sin GPU, ultralytics usa CPU automáticamente (NFR-4); el primer uso descarga `yolo26n.pt`. Con `--resume`, los hiperparámetros guardados en el checkpoint tienen prioridad. La clase `0` corresponde a `plant`.
+
+---
+
 ## Flujo de datos completo (cómo encajan las piezas)
 
 ```
@@ -174,7 +239,8 @@ Foto de dron (celular/dron/ortomosaico)
   │
   └─► Fase 2: tile_pipeline.py (preparación para ML)
         fotos → tiles etiquetables + manifest.csv
-        → (futuro) Roboflow/CVAT → modelo entrenado → Fase 1 con IA
+        → etiquetas YOLO (sidecars .txt) → prepare_dataset.py → train.py
+        → modelo entrenado (mAP en consola) → Fase 1 con IA
 ```
 
 ---
@@ -237,7 +303,7 @@ python3 tile_pipeline.py --input ./fotos_dron --output ./tiles
 ## Roadmap y próximos pasos sugeridos
 
 1. ~~Inicializar **git** (repo + commits conventionales) y añadir `.gitignore`.~~ — **hecho** en el PR1 del cambio `yolo-training-pipeline`.
-2. **Fase 2–3** (cambio `yolo-training-pipeline`): etiquetar tiles en Roboflow/CVAT usando el `manifest.csv`; `prepare_dataset.py` con split por vuelo y `data.yaml` (PR2, pendiente) y `train.py` con YOLO26 + validación (PR3, pendiente) para copas solapadas.
+2. **Fase 2–3** (cambio `yolo-training-pipeline`): ~~etiquetar tiles en Roboflow/CVAT usando el `manifest.csv`; `prepare_dataset.py` con split por vuelo y `data.yaml` (PR2) y `train.py` con YOLO26 + validación (PR3)~~ — **hecho**: ver Módulo 3; queda pendiente etiquetar datos reales y correr el primer entrenamiento.
 3. Optimización opcional: `OffscreenCanvas` dentro del worker para evitar el `getImageData`/transferencia en el hilo principal.
 
 ---
