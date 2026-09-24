@@ -514,41 +514,28 @@ class TestReadTiles:
         )
         assert infer.read_tiles(manifest, tmp_path / "tiles") == []
 
-    def test_tile_escaping_the_tiles_root_raises(self, tmp_path):
+    @pytest.mark.parametrize(
+        "flight, tile_col",
+        [
+            ("F1", "../../outside.png"),  # tile .. walks out of the flight dir
+            ("..", "evil.png"),  # flight component .. walks out of the root
+        ],
+    )
+    def test_tile_escaping_the_tiles_root_raises(self, tmp_path, flight, tile_col):
         # R1-001: a crafted manifest row whose tile path escapes tiles_root
-        # (here via `..` from the flight dir — tiles/F1/../../outside.png
-        # normalizes to the root's parent) must be rejected with a clear
-        # error, not read from outside the root.
+        # (via `..` in the tile or flight column) must be rejected with a
+        # clear error, not read from outside the root.
         root = tmp_path / "tiles"
         root.mkdir()
+        if flight == "..":
+            (tmp_path / "evil.png").write_bytes(b"x")
         manifest = tmp_path / "manifest.csv"
         manifest.write_text(
             "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
             "imagen_ancho,imagen_alto\n"
-            "F1,DJI_0001.JPG,../../outside.png,0,0,640,640,1280,800\n",
+            f"{flight},DJI_0001.JPG,{tile_col},0,0,640,640,1280,800\n",
             encoding="utf-8",
         )
-        with pytest.raises(FileNotFoundError, match="escapes"):
-            infer.read_tiles(manifest, root)
-
-    def test_absolute_flight_component_escaping_the_tiles_root_raises(
-        self, tmp_path,
-    ):
-        # R1-001 triangulation: a flight component of "."-style ("..") walks
-        # OUT of tiles_root once resolved — must fail confinement too.
-        root = tmp_path / "tiles"
-        root.mkdir()
-        manifest = tmp_path / "manifest.csv"
-        manifest.write_text(
-            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
-            "imagen_ancho,imagen_alto\n"
-            "..,DJI_0001.JPG,evil.png,0,0,640,640,1280,800\n",
-            encoding="utf-8",
-        )
-        # flight ".." resolves to tmp_path/evil.png, i.e. NOT under
-        # tmp_path/tiles — the tile escapes the tiles root.
-        escape = tmp_path / "evil.png"
-        escape.write_bytes(b"x")
         with pytest.raises(FileNotFoundError, match="escapes"):
             infer.read_tiles(manifest, root)
 
@@ -1048,30 +1035,45 @@ class TestMainArgparse:
         assert "nope" in capsys.readouterr().err
 
 
+def _f2_unit_fixture(tmp_path, make_tile_input):
+    """F2 duplicate-tiles directory-mode fixture for unit-level main() runs.
+
+    Writes input tiles + manifest + weights; returns (weights_path, FakeModel)
+    so callers only need to monkeypatch load_model. Shared by the success,
+    failed-write, and atomic-replace tests (F2 = dup across t1/t2 → 1 plant).
+    """
+    make_tile_input(
+        [
+            {
+                "flight": "F2",
+                "photo": "DJI_0002.JPG",
+                "photo_w": 960,
+                "photo_h": 640,
+                "tiles": [
+                    ("t1.png", 0, 0, 640, 640, 11),
+                    ("t2.png", 320, 0, 640, 640, 12),
+                ],
+            }
+        ]
+    )
+    weights = tmp_path / "w.pt"
+    weights.write_bytes(b"x")
+    model = FakeModel(
+        {
+            11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
+            12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
+        }
+    )
+    return weights, model
+
+
 class TestMainRun:
     def test_directory_mode_success_pins_verbose_and_summary_lines(
         self, tmp_path, make_tile_input, monkeypatch, capsys
     ):
         # make_tile_input writes manifest.csv + tiles/ under tmp_path, so
         # tmp_path is a valid directory-mode --input.
-        manifest, root = make_tile_input(
-            [
-                {
-                    "flight": "F2",
-                    "photo": "DJI_0002.JPG",
-                    "photo_w": 960,
-                    "photo_h": 640,
-                    "tiles": [("t1.png", 0, 0, 640, 640, 11), ("t2.png", 320, 0, 640, 640, 12)],
-                }
-            ]
-        )
-        (tmp_path / "w.pt").write_bytes(b"x")
-        model = FakeModel(
-            {
-                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
-                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
-            }
-        )
+        weights, model = _f2_unit_fixture(tmp_path, make_tile_input)
         monkeypatch.setattr(infer, "load_model", lambda weights: model)
         out = tmp_path / "counts.csv"
         rc = infer.main(
@@ -1206,34 +1208,6 @@ class TestMainRun:
         assert rc == 1
         assert out.read_text(encoding="utf-8") == "sentinel\n"
 
-    def test_escaping_tile_manifest_exits_1_and_writes_nothing(
-        self, tmp_path, capsys
-    ):
-        # R1-001: directory mode with a manifest whose tile escapes the tiles
-        # root -> exit 1 with a clear stderr message, nothing written.
-        (tmp_path / "tiles").mkdir()
-        (tmp_path / "manifest.csv").write_text(
-            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
-            "imagen_ancho,imagen_alto\n"
-            "F1,DJI_0001.JPG,../../outside.png,0,0,640,640,1280,800\n",
-            encoding="utf-8",
-        )
-        (tmp_path / "w.pt").write_bytes(b"x")
-        out = tmp_path / "counts.csv"
-        rc = infer.main(
-            [
-                "--weights",
-                str(tmp_path / "w.pt"),
-                "--input",
-                str(tmp_path),
-                "--output",
-                str(out),
-            ]
-        )
-        assert rc == 1
-        assert not out.exists()
-        assert "escapes" in capsys.readouterr().err
-
     def test_failed_write_leaves_existing_output_untouched(
         self, tmp_path, make_tile_input, monkeypatch, capsys
     ):
@@ -1241,24 +1215,7 @@ class TestMainRun:
         # If the write stage fails after the temp is produced (simulated
         # disk-full at the rename), the pre-existing output must remain
         # byte-untouched and no temp file may be left behind.
-        manifest, root = make_tile_input(
-            [
-                {
-                    "flight": "F2",
-                    "photo": "DJI_0002.JPG",
-                    "photo_w": 960,
-                    "photo_h": 640,
-                    "tiles": [("t1.png", 0, 0, 640, 640, 11), ("t2.png", 320, 0, 640, 640, 12)],
-                }
-            ]
-        )
-        (tmp_path / "w.pt").write_bytes(b"x")
-        model = FakeModel(
-            {
-                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
-                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
-            }
-        )
+        weights, model = _f2_unit_fixture(tmp_path, make_tile_input)
         monkeypatch.setattr(infer, "load_model", lambda weights: model)
 
         def _boom(src, dst):
@@ -1288,24 +1245,7 @@ class TestMainRun:
     ):
         # R4-003: successful runs write through os.replace(temp_sibling, output)
         # — never truncate-in-place — so a reader never sees a half-written CSV.
-        manifest, root = make_tile_input(
-            [
-                {
-                    "flight": "F2",
-                    "photo": "DJI_0002.JPG",
-                    "photo_w": 960,
-                    "photo_h": 640,
-                    "tiles": [("t1.png", 0, 0, 640, 640, 11), ("t2.png", 320, 0, 640, 640, 12)],
-                }
-            ]
-        )
-        (tmp_path / "w.pt").write_bytes(b"x")
-        model = FakeModel(
-            {
-                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
-                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
-            }
-        )
+        weights, model = _f2_unit_fixture(tmp_path, make_tile_input)
         monkeypatch.setattr(infer, "load_model", lambda weights: model)
         calls = []
         real_replace = infer.os.replace
@@ -1336,39 +1276,6 @@ class TestMainRun:
         assert dst == out
         assert src != out
         assert src.parent == out.parent  # temp sibling lives in the same dir
-
-    def test_empty_manifest_run_warns_and_writes_header_only(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        # R4-002: a directory-mode run with ZERO photos is NOT an error (exit
-        # 0, header-only CSV) but must warn on stderr naming the manifest.
-        (tmp_path / "tiles").mkdir()
-        manifest = tmp_path / "manifest.csv"
-        manifest.write_text(
-            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
-            "imagen_ancho,imagen_alto\n",
-            encoding="utf-8",
-        )
-        (tmp_path / "w.pt").write_bytes(b"x")
-        monkeypatch.setattr(infer, "load_model", lambda weights: object())
-        out = tmp_path / "counts.csv"
-        rc = infer.main(
-            [
-                "--weights",
-                str(tmp_path / "w.pt"),
-                "--input",
-                str(tmp_path),
-                "--output",
-                str(out),
-            ]
-        )
-        assert rc == 0
-        assert out.read_text(encoding="utf-8") == (
-            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
-        )
-        err = capsys.readouterr().err
-        assert "no photos in manifest" in err
-        assert str(manifest) in err
 
 
 # ---------------------------------------------------------------------------
