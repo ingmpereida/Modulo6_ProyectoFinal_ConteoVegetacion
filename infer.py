@@ -20,7 +20,9 @@ import argparse
 import csv
 import io
 import itertools
+import os
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +32,7 @@ from PIL import Image
 
 
 __all__ = [
+    "PLANT_CLASS",
     "Box",
     "TileSpec",
     "PhotoResult",
@@ -48,6 +51,11 @@ __all__ = [
     "main",
 ]
 
+# class index of the plant in the trained data.yaml class order (R2-004).
+# Changing the class order in data.yaml changes what class 0 means and MUST
+# be paired with an update of this constant.
+PLANT_CLASS = 0
+
 
 @dataclass(frozen=True)
 class Box:
@@ -62,12 +70,15 @@ class Box:
     cls: int
 
 
-def filter_boxes(boxes: list[dict], conf: float, cls: int = 0) -> list[Box]:
+def filter_boxes(boxes: list[dict], conf: float, cls: int = PLANT_CLASS) -> list[Box]:
     """Keep detections of ``cls`` with confidence ``>= conf``, in input order.
 
     ``boxes`` is the raw predictor output: dicts with ``xyxy`` (list of 4
     floats), ``conf`` (float), ``cls`` (int). Returns frozen Boxes, so later
     pipeline stages (project/clip/NMS) can rely on immutability (FR-3).
+    The default ``cls`` is PLANT_CLASS (0) — the plant class index in the
+    trained data.yaml class order (R2-004); counts are always computed for
+    that class, so reordering data.yaml classes must update PLANT_CLASS.
     """
     kept: list[Box] = []
     for raw in boxes:
@@ -195,18 +206,29 @@ def read_tiles(manifest_path: Path, tiles_root: Path) -> list[TileSpec]:
     x_offset, y_offset, tile_w, tile_h, imagen_ancho, imagen_alto. Each tile
     resolves to ``tiles_root / vuelo / tile``; a manifest that references a
     missing tile image raises FileNotFoundError (the CLI maps it to exit 1).
+    Tile paths are CONFINED to the tiles root (R1-001): every tile is
+    resolved and must stay under ``tiles_root`` — a crafted ``..`` or
+    absolute component that would escape the root raises FileNotFoundError
+    naming the offending row/tile.
     """
     tiles: list[TileSpec] = []
+    root_resolved = Path(tiles_root).resolve()
     with Path(manifest_path).open("r", newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
-            tile_path = tiles_root / row["vuelo"] / row["tile"]
-            if not tile_path.is_file():
+        for row_no, row in enumerate(csv.DictReader(fh), start=2):  # header is line 1
+            tile_path = root_resolved / row["vuelo"] / row["tile"]
+            tile_resolved = tile_path.resolve()
+            if not tile_resolved.is_relative_to(root_resolved):
                 raise FileNotFoundError(
-                    f"manifest references missing tile image: {tile_path}"
+                    f"manifest row {row_no} tile {row['tile']!r} escapes the "
+                    f"tiles root: {tile_resolved} (expected under {root_resolved})"
+                )
+            if not tile_resolved.is_file():
+                raise FileNotFoundError(
+                    f"manifest references missing tile image: {tile_resolved}"
                 )
             tiles.append(
                 TileSpec(
-                    path=tile_path,
+                    path=tile_resolved,
                     flight=row["vuelo"],
                     photo=row["imagen_origen"],
                     x_offset=int(row["x_offset"]),
@@ -328,6 +350,12 @@ class _UltralyticsPredictor:
         results = self._model.predict(image)
         try:
             boxes = results[0].boxes
+            if boxes is None:
+                # Zero detections (ultralytics 8.4.x sets boxes=None for an
+                # empty photo): empty photos are the norm in plant counting,
+                # so yield no detections instead of aborting the batch
+                # (R4-001 — overrides the previous fail-fast on no boxes).
+                return []
             xyxy_rows = boxes.xyxy.tolist()
             confs = boxes.conf.tolist()
             clss = boxes.cls.tolist()
@@ -473,6 +501,33 @@ def _single_photo_tiles(path: Path) -> list[TileSpec]:
     ]
 
 
+def _write_output_atomic(output: Path, data: bytes) -> None:
+    """Write ``data`` to ``output`` atomically (R1-004/R4-003).
+
+    The bytes go to a temp file in the SAME directory as ``output`` (same
+    filesystem, so the final swap is atomic), are flushed and fsync'd, then
+    ``os.replace`` moves them over the target. A crash, kill, or disk-full
+    mid-write leaves any pre-existing output byte-untouched, and a reader
+    never observes a half-written CSV. On failure the temp file is unlinked.
+    """
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=output.parent, prefix=f"{output.name}.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, output)
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass  # already replaced (success) or never created — best effort
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the counting CLI and return the process exit code (FR-1).
 
@@ -507,6 +562,14 @@ def main(argv: list[str] | None = None) -> int:
         groups: dict[tuple[str, str], list[TileSpec]] = {}
         for tile in tiles:
             groups.setdefault((tile.flight, tile.photo), []).append(tile)
+        if not groups:
+            # Empty manifest: not an error (R4-002) — header-only CSV is
+            # still written — but the silent success must be observable.
+            print(
+                f"warning: no photos in manifest {manifest}: header-only CSV "
+                "written (no rows produced)",
+                file=sys.stderr,
+            )
 
         rows: list[dict] = []
         for (flight, photo), photo_tiles in groups.items():
@@ -529,9 +592,9 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
 
-        # Validate-then-write (D7): render once, write once, bytes only.
+        # Validate-then-write (D7): render once, write once atomically (R4-003).
         csv_text = render_csv(rows)
-        Path(args.output).write_bytes(csv_text.encode("utf-8"))
+        _write_output_atomic(Path(args.output), csv_text.encode("utf-8"))
         if args.summary:
             for line in render_summaries(rows):
                 print(line)

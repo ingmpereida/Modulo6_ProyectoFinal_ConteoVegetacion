@@ -1,12 +1,18 @@
-"""Tests for infer.py pure geometry core (PR1: tasks 1.1-1.6).
+"""Tests for infer.py — geometry core, counting pipeline, CLI, and gates.
 
-Covers the pixel-space xyxy Box contract, class+conf filtering, offset
-projection, photo-bound clipping, IoU, and deterministic global NMS dedup.
-CPU-only and ultralytics-free by design (NFR-1, NFR-2): in this PR the
-module is a plain importable library — no CLI, no YOLO runtime.
+Spans the full module as shipped across PR1-PR3: the pixel-space xyxy Box
+contract with class+conf filtering, offset projection, photo-bound
+clipping, IoU, and deterministic global NMS dedup; the manifest-driven
+counting pipeline (read_tiles/count_photo/render) over real Pillow-decoded
+tiles via FakeModel; the main() CLI contract through unit tests and real
+subprocess runs against a fake ultralytics package (PYTHONPATH stub); and
+the PR1/PR2/PR3 source-scan + determinism gates. CPU-only and
+ultralytics-free by design (NFR-1, NFR-2) — the YOLO runtime is never
+imported at module level; the seam is load_model's lazy import.
 """
 
 import dataclasses
+import inspect
 import io
 import os
 import re
@@ -31,6 +37,15 @@ def test_importing_infer_never_imports_ultralytics():
 # ---------------------------------------------------------------------------
 # PR1 1.1: Box dataclass + filter_boxes (class + confidence filter)
 # ---------------------------------------------------------------------------
+
+
+class TestPlantClass:
+    def test_plant_class_constant_is_zero_and_is_the_filter_default(self):
+        # R2-004: the plant class (0) is a named exported constant and the
+        # default filter target — an unnamed assumption must never hide it.
+        assert infer.PLANT_CLASS == 0
+        default = inspect.signature(infer.filter_boxes).parameters["cls"].default
+        assert default == infer.PLANT_CLASS
 
 
 class TestBox:
@@ -499,6 +514,31 @@ class TestReadTiles:
         )
         assert infer.read_tiles(manifest, tmp_path / "tiles") == []
 
+    @pytest.mark.parametrize(
+        "flight, tile_col",
+        [
+            ("F1", "../../outside.png"),  # tile .. walks out of the flight dir
+            ("..", "evil.png"),  # flight component .. walks out of the root
+        ],
+    )
+    def test_tile_escaping_the_tiles_root_raises(self, tmp_path, flight, tile_col):
+        # R1-001: a crafted manifest row whose tile path escapes tiles_root
+        # (via `..` in the tile or flight column) must be rejected with a
+        # clear error, not read from outside the root.
+        root = tmp_path / "tiles"
+        root.mkdir()
+        if flight == "..":
+            (tmp_path / "evil.png").write_bytes(b"x")
+        manifest = tmp_path / "manifest.csv"
+        manifest.write_text(
+            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
+            "imagen_ancho,imagen_alto\n"
+            f"{flight},DJI_0001.JPG,{tile_col},0,0,640,640,1280,800\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(FileNotFoundError, match="escapes"):
+            infer.read_tiles(manifest, root)
+
 
 # ---------------------------------------------------------------------------
 # PR2 2.5: count_photo — per-photo pipeline (load->predict->filter->project->
@@ -808,6 +848,13 @@ class _FakeResults:
         self.boxes = _FakeBoxes(raw)
 
 
+class _NoDetectionsResult:
+    """An ultralytics-style result whose boxes attribute is None (zero detections)."""
+
+    def __init__(self):
+        self.boxes = None
+
+
 class _FakePredictorModel:
     """Model whose .predict returns canned ultralytics-style results."""
 
@@ -858,7 +905,19 @@ class TestUltralyticsAdapter:
         assert out[0]["conf"] == 0.9
         assert out[0]["cls"] == 0
 
-    def test_fails_fast_when_results_have_no_boxes(self):
+    def test_boxes_none_returns_empty_list(self):
+        # R4-001: ultralytics 8.4.x returns boxes=None for a photo with zero
+        # detections — empty photos are the NORM in plant counting, so this
+        # must yield an empty detection list, never a RuntimeError.
+        predictor = infer._UltralyticsPredictor(
+            _FakePredictorModel([_NoDetectionsResult()])
+        )
+        assert predictor.predict(np.zeros((4, 4, 3), dtype=np.uint8)) == []
+
+    def test_fails_fast_when_results_have_no_boxes_attribute(self):
+        # Drift guard: a result missing the boxes attribute entirely is NOT a
+        # valid ultralytics Results and still fails fast — only a real
+        # boxes=None (zero detections) is treated as empty (R4-001).
         class _NoBoxes:
             pass
 
@@ -976,30 +1035,45 @@ class TestMainArgparse:
         assert "nope" in capsys.readouterr().err
 
 
+def _f2_unit_fixture(tmp_path, make_tile_input):
+    """F2 duplicate-tiles directory-mode fixture for unit-level main() runs.
+
+    Writes input tiles + manifest + weights; returns (weights_path, FakeModel)
+    so callers only need to monkeypatch load_model. Shared by the success,
+    failed-write, and atomic-replace tests (F2 = dup across t1/t2 → 1 plant).
+    """
+    make_tile_input(
+        [
+            {
+                "flight": "F2",
+                "photo": "DJI_0002.JPG",
+                "photo_w": 960,
+                "photo_h": 640,
+                "tiles": [
+                    ("t1.png", 0, 0, 640, 640, 11),
+                    ("t2.png", 320, 0, 640, 640, 12),
+                ],
+            }
+        ]
+    )
+    weights = tmp_path / "w.pt"
+    weights.write_bytes(b"x")
+    model = FakeModel(
+        {
+            11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
+            12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
+        }
+    )
+    return weights, model
+
+
 class TestMainRun:
     def test_directory_mode_success_pins_verbose_and_summary_lines(
         self, tmp_path, make_tile_input, monkeypatch, capsys
     ):
         # make_tile_input writes manifest.csv + tiles/ under tmp_path, so
         # tmp_path is a valid directory-mode --input.
-        manifest, root = make_tile_input(
-            [
-                {
-                    "flight": "F2",
-                    "photo": "DJI_0002.JPG",
-                    "photo_w": 960,
-                    "photo_h": 640,
-                    "tiles": [("t1.png", 0, 0, 640, 640, 11), ("t2.png", 320, 0, 640, 640, 12)],
-                }
-            ]
-        )
-        (tmp_path / "w.pt").write_bytes(b"x")
-        model = FakeModel(
-            {
-                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
-                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
-            }
-        )
+        weights, model = _f2_unit_fixture(tmp_path, make_tile_input)
         monkeypatch.setattr(infer, "load_model", lambda weights: model)
         out = tmp_path / "counts.csv"
         rc = infer.main(
@@ -1134,6 +1208,75 @@ class TestMainRun:
         assert rc == 1
         assert out.read_text(encoding="utf-8") == "sentinel\n"
 
+    def test_failed_write_leaves_existing_output_untouched(
+        self, tmp_path, make_tile_input, monkeypatch, capsys
+    ):
+        # R1-004/R4-003: the final CSV write is atomic (temp file + os.replace).
+        # If the write stage fails after the temp is produced (simulated
+        # disk-full at the rename), the pre-existing output must remain
+        # byte-untouched and no temp file may be left behind.
+        weights, model = _f2_unit_fixture(tmp_path, make_tile_input)
+        monkeypatch.setattr(infer, "load_model", lambda weights: model)
+
+        def _boom(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(infer.os, "replace", _boom)
+        out = tmp_path / "counts.csv"
+        out.write_text("sentinel\n", encoding="utf-8")
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 1
+        assert out.read_text(encoding="utf-8") == "sentinel\n"
+        assert "disk full" in capsys.readouterr().err
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith("counts.csv.")]
+        assert leftovers == []  # temp file cleaned up
+
+    def test_successful_run_writes_via_atomic_replace(
+        self, tmp_path, make_tile_input, monkeypatch
+    ):
+        # R4-003: successful runs write through os.replace(temp_sibling, output)
+        # — never truncate-in-place — so a reader never sees a half-written CSV.
+        weights, model = _f2_unit_fixture(tmp_path, make_tile_input)
+        monkeypatch.setattr(infer, "load_model", lambda weights: model)
+        calls = []
+        real_replace = infer.os.replace
+
+        def _spy(src, dst):
+            calls.append((Path(src), Path(dst)))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(infer.os, "replace", _spy)
+        out = tmp_path / "counts.csv"
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+            "F2,DJI_0002.JPG,1,2,1,t1.png;t2.png\n"
+        )
+        assert len(calls) == 1
+        src, dst = calls[0]
+        assert dst == out
+        assert src != out
+        assert src.parent == out.parent  # temp sibling lives in the same dir
+
 
 # ---------------------------------------------------------------------------
 # PR3 3.6: subprocess CLI contract — run the real `python infer.py` end-to-end
@@ -1171,9 +1314,11 @@ def _write_fake_ultralytics(root, pinned):
 
     ``pinned`` maps the tile's first-pixel red-byte marker (the same stable
     marker contract as conftest.FakeModel) to canned detections
-    ``[{xyxy, conf, cls}]``. The stub exposes ``YOLO`` whose ``predict()``
-    returns one ``_Results`` with numpy ``xyxy/conf/cls`` arrays and a
-    ``names`` dict — exactly the shape ``_UltralyticsPredictor`` consumes.
+    ``[{xyxy, conf, cls}]`` — or ``None`` to simulate a zero-detection photo
+    (ultralytics returns ``boxes=None`` for it, R4-001). The stub exposes
+    ``YOLO`` whose ``predict()`` returns one ``_Results`` with numpy
+    ``xyxy/conf/cls`` arrays (or ``boxes=None``) and a ``names`` dict —
+    exactly the shape ``_UltralyticsPredictor`` consumes.
     """
     pkg = root / "ultralytics"
     pkg.mkdir(parents=True)
@@ -1187,19 +1332,21 @@ def _write_fake_ultralytics(root, pinned):
         "        self.conf = np.array(conf, dtype=float)\n"
         "        self.cls = np.array(cls, dtype=int)\n"
         "class _Results:\n"
-        "    def __init__(self, xyxy, conf, cls):\n"
-        "        self.boxes = _Boxes(xyxy, conf, cls)\n"
+        "    def __init__(self, boxes):\n"
+        "        self.boxes = boxes\n"
         "        self.names = {0: 'plant'}\n"
         "class YOLO:\n"
         "    def __init__(self, weights):\n"
         "        self.weights = weights\n"
         "    def predict(self, image):\n"
-        "        dets = PINNED.get(int(image[0, 0, 0]), [])\n"
-        "        return [_Results(\n"
+        "        dets = PINNED.get(int(image[0, 0, 0]))\n"
+        "        if dets is None:\n"
+        "            return [_Results(None)]  # zero detections -> boxes=None\n"
+        "        return [_Results(_Boxes(\n"
         "            [d['xyxy'] for d in dets],\n"
         "            [d['conf'] for d in dets],\n"
         "            [d['cls'] for d in dets],\n"
-        "        )]\n",
+        "        ))]\n",
         encoding="utf-8",
     )
     return root
@@ -1315,14 +1462,10 @@ class TestSubprocessCli:
         assert not out.exists()
         assert "manifest.csv" in proc.stderr
 
-    def _f2_success_args(self, tmp_path, make_tile_input):
-        """Build the F2 duplicate-tiles success run; return (args, env, out)."""
-        return _f2_subprocess_fixture(tmp_path, make_tile_input)
-
     def test_successful_directory_mode_writes_exact_csv_and_pins(
         self, tmp_path, make_tile_input
     ):
-        args, env, out = self._f2_success_args(tmp_path, make_tile_input)
+        args, env, out = _f2_subprocess_fixture(tmp_path, make_tile_input)
         proc = _run_infer(args, env=env)
         assert proc.returncode == 0
         assert out.read_text(encoding="utf-8") == (
@@ -1335,13 +1478,93 @@ class TestSubprocessCli:
             in proc.stdout
         )
 
-    def test_rerun_is_byte_identical(self, tmp_path, make_tile_input):
-        args, env, out = self._f2_success_args(tmp_path, make_tile_input)
-        first = _run_infer(args, env=env)
-        first_bytes = out.read_bytes()
-        second = _run_infer(args, env=env)
-        assert first.returncode == second.returncode == 0
-        assert out.read_bytes() == first_bytes  # NFR-3: identical inputs -> identical bytes
+    def test_empty_manifest_warns_and_writes_header_only(self, tmp_path):
+        # R4-002: zero-photo directory run exits 0 and writes the header-only
+        # CSV, with a stderr warning naming the manifest (observable, not an
+        # error).
+        (tmp_path / "tiles").mkdir()
+        manifest = tmp_path / "manifest.csv"
+        manifest.write_text(
+            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
+            "imagen_ancho,imagen_alto\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        stub = _write_fake_ultralytics(tmp_path / "stub", {})
+        out = tmp_path / "counts.csv"
+        proc = _run_infer(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+            ],
+            env=_stub_env(stub),
+        )
+        assert proc.returncode == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+        )
+        assert "no photos in manifest" in proc.stderr
+        assert str(manifest) in proc.stderr
+
+    def test_zero_detection_photo_yields_zero_row_and_does_not_abort(
+        self, tmp_path, make_tile_input
+    ):
+        # R4-001: a photo with no detections (ultralytics boxes=None) yields
+        # a 0-count CSV row and MUST NOT abort the batch — the next photo is
+        # still counted.
+        make_tile_input(
+            [
+                {
+                    "flight": "F9",
+                    "photo": "DJI_0009.JPG",
+                    "photo_w": 640,
+                    "photo_h": 640,
+                    "tiles": [("e1.png", 0, 0, 640, 640, 91)],  # no detections
+                },
+                {
+                    "flight": "F9",
+                    "photo": "DJI_0010.JPG",
+                    "photo_w": 640,
+                    "photo_h": 640,
+                    "tiles": [("n1.png", 0, 0, 640, 640, 92)],  # one plant
+                },
+            ]
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        stub = _write_fake_ultralytics(
+            tmp_path / "stub",
+            {
+                91: None,  # boxes=None for this photo
+                92: [{"xyxy": [10.0, 10.0, 110.0, 110.0], "conf": 0.9, "cls": 0}],
+            },
+        )
+        out = tmp_path / "counts.csv"
+        proc = _run_infer(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+                "--verbose",
+            ],
+            env=_stub_env(stub),
+        )
+        assert proc.returncode == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+            "F9,DJI_0009.JPG,0,0,0,\n"
+            "F9,DJI_0010.JPG,1,1,0,n1.png\n"
+        )
+        assert (
+            "verbose flight=F9 photo=DJI_0009.JPG tiles=1 boxes=0 kept=0"
+            in proc.stdout
+        )
 
 
 # ---------------------------------------------------------------------------
