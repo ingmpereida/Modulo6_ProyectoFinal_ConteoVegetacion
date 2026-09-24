@@ -16,6 +16,7 @@ import pytest
 from PIL import Image
 
 import infer
+from conftest import FakeModel
 
 
 def test_importing_infer_never_imports_ultralytics():
@@ -382,15 +383,11 @@ class TestLoadImage:
 
 class TestFakeModel:
     def test_predict_returns_canned_boxes_keyed_on_first_pixel_byte(self):
-        from conftest import FakeModel
-
         model = FakeModel({5: [{"xyxy": [0, 0, 10, 10], "conf": 0.9, "cls": 0}]})
         out = model.predict(np.full((4, 4, 3), 5, dtype=np.uint8))
         assert out == [{"xyxy": [0, 0, 10, 10], "conf": 0.9, "cls": 0}]
 
     def test_unknown_marker_yields_no_detections(self):
-        from conftest import FakeModel
-
         model = FakeModel({5: [{"xyxy": [0, 0, 10, 10], "conf": 0.9, "cls": 0}]})
         assert model.predict(np.full((2, 2, 3), 9, dtype=np.uint8)) == []
 
@@ -429,3 +426,183 @@ class TestMakeTileInput:
             for name in ("t1.png", "t2.png")
         ]
         assert markers == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# PR2 2.3: read_tiles — manifest.csv -> manifest-row-ordered TileSpec list
+# ---------------------------------------------------------------------------
+
+
+class TestReadTiles:
+    def test_parses_fields_paths_and_preserves_row_order(self, make_tile_input):
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F1",
+                    "photo": "DJI_0001.JPG",
+                    "photo_w": 1280,
+                    "photo_h": 800,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 1), ("t2.png", 320, 0, 640, 640, 2)],
+                }
+            ]
+        )
+        tiles = infer.read_tiles(manifest, root)
+        assert [t.path.name for t in tiles] == ["t1.png", "t2.png"]  # row order kept
+        first = tiles[0]
+        assert first.flight == "F1"
+        assert first.photo == "DJI_0001.JPG"
+        assert (first.x_offset, first.y_offset) == (0, 0)
+        assert (first.tile_w, first.tile_h) == (640, 640)
+        assert (first.photo_w, first.photo_h) == (1280, 800)
+        assert first.path == root / "F1" / "t1.png"
+
+    def test_missing_referenced_tile_raises_file_not_found(self, make_tile_input):
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F1",
+                    "photo": "DJI_0001.JPG",
+                    "photo_w": 1280,
+                    "photo_h": 800,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 1)],
+                }
+            ]
+        )
+        (root / "F1" / "t1.png").unlink()
+        with pytest.raises(FileNotFoundError):
+            infer.read_tiles(manifest, root)
+
+    def test_missing_manifest_file_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            infer.read_tiles(tmp_path / "manifest.csv", tmp_path / "tiles")
+
+    def test_empty_manifest_yields_no_tiles(self, tmp_path):
+        manifest = tmp_path / "manifest.csv"
+        manifest.write_text(
+            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,imagen_ancho,imagen_alto\n",
+            encoding="utf-8",
+        )
+        assert infer.read_tiles(manifest, tmp_path / "tiles") == []
+
+
+# ---------------------------------------------------------------------------
+# PR2 2.5: count_photo — per-photo pipeline (load->predict->filter->project->
+# clip->global NMS), via FakeModel integration (hand-computed expectations)
+# ---------------------------------------------------------------------------
+
+
+class TestCountPhoto:
+    def test_duplicate_across_tiles_counts_once(self, make_tile_input):
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F2",
+                    "photo": "DJI_0002.JPG",
+                    "photo_w": 960,
+                    "photo_h": 640,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 11), ("t2.png", 320, 0, 640, 640, 12)],
+                }
+            ]
+        )
+        tiles = infer.read_tiles(manifest, root)
+        model = FakeModel(
+            {
+                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
+                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
+            }
+        )
+        result = infer.count_photo(tiles, infer.load_image, model.predict, 0.25, 0.5)
+        assert result.global_count == 1  # same plant seen from both tiles
+        assert result.box_count == 2
+        assert result.dedup_removed == 1
+        assert result.source_tiles == ("t1.png", "t2.png")  # both contributors listed
+
+    def test_border_partial_and_distinct_plants_survive(self, make_tile_input):
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F1",
+                    "photo": "DJI_0001.JPG",
+                    "photo_w": 1280,
+                    "photo_h": 800,
+                    "tiles": [
+                        ("t1.png", 0, 0, 640, 640, 1),
+                        ("t2.png", 320, 0, 640, 640, 2),
+                        ("t3.png", 640, 0, 640, 640, 3),
+                        ("t4.png", 0, 640, 640, 160, 4),
+                    ],
+                }
+            ]
+        )
+        tiles = infer.read_tiles(manifest, root)
+        model = FakeModel(
+            {
+                # A in t1 at full size, B distinct in t1, dup of A in t2, nothing in t3,
+                # C half-cropped at the photo bottom border in t4 (tile_h < 640).
+                1: [
+                    {"xyxy": [380.0, 100.0, 460.0, 180.0], "conf": 0.9, "cls": 0},
+                    {"xyxy": [20.0, 500.0, 100.0, 580.0], "conf": 0.8, "cls": 0},
+                ],
+                2: [{"xyxy": [60.0, 100.0, 140.0, 180.0], "conf": 0.7, "cls": 0}],
+                3: [],
+                4: [{"xyxy": [250.0, 140.0, 330.0, 160.0], "conf": 0.6, "cls": 0}],
+            }
+        )
+        result = infer.count_photo(tiles, infer.load_image, model.predict, 0.25, 0.5)
+        assert result.box_count == 4
+        assert result.global_count == 3  # A merged; B and clipped C each counted once
+        assert result.dedup_removed == 1
+        assert result.source_tiles == ("t1.png", "t2.png", "t4.png")
+
+    def test_single_tile_photo_skips_dedup(self, make_tile_input):
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F3",
+                    "photo": "DJI_0003.JPG",
+                    "photo_w": 640,
+                    "photo_h": 640,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 21)],
+                }
+            ]
+        )
+        tiles = infer.read_tiles(manifest, root)
+        model = FakeModel(
+            {
+                # two heavily overlapping boxes (IoU ~0.68 >= 0.5): would merge
+                # if dedup ran — with a single tile there is nothing to dedup
+                # against, so both are counted (D6, FR-2 single-photo scenario).
+                21: [
+                    {"xyxy": [50.0, 50.0, 150.0, 150.0], "conf": 0.9, "cls": 0},
+                    {"xyxy": [60.0, 60.0, 160.0, 160.0], "conf": 0.8, "cls": 0},
+                ],
+            }
+        )
+        result = infer.count_photo(tiles, infer.load_image, model.predict, 0.25, 0.5)
+        assert result.global_count == 2
+        assert result.box_count == 2
+        assert result.dedup_removed == 0
+        assert result.source_tiles == ("t1.png",)
+
+    def test_sub_threshold_and_other_class_boxes_never_count(self, make_tile_input):
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F1",
+                    "photo": "DJI_0001.JPG",
+                    "photo_w": 640,
+                    "photo_h": 640,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 31)],
+                }
+            ]
+        )
+        tiles = infer.read_tiles(manifest, root)
+        model = FakeModel(
+            {31: [{"xyxy": [0.0, 0.0, 10.0, 10.0], "conf": 0.1, "cls": 0}]}
+        )
+        result = infer.count_photo(tiles, infer.load_image, model.predict, 0.25, 0.5)
+        assert result.global_count == 0  # below --conf, dropped by the filter
+
+    def test_empty_tiles_raise_value_error(self):
+        with pytest.raises(ValueError):
+            infer.count_photo([], infer.load_image, lambda img: [], 0.25, 0.5)
