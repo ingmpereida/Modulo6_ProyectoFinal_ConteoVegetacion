@@ -1355,10 +1355,14 @@ class TestPr3Gate:
     def test_module_imports_and_help_work_without_ultralytics(self):
         # A real subprocess with NO fake ultralytics on PYTHONPATH completes
         # both the import (lazy seam proven: no ModuleNotFoundError) and the
-        # --help path (rc 0, all args listed) — NFR-1 end to end.
+        # --help path (rc 0, all args listed) — NFR-1 end to end. The import
+        # must succeed on ANY machine, regardless of whether ultralytics is
+        # installed (asserting find_spec is None would make the suite depend
+        # on the environment; the ultralytics-free property is pinned by the
+        # controlled-PYTHONPATH subprocess tests above).
         script = str(Path(infer.__file__).resolve())
         import_proc = subprocess.run(
-            [sys.executable, "-c", f"import importlib.util; assert importlib.util.find_spec('ultralytics') is None; import infer"],
+            [sys.executable, "-c", "import infer"],
             capture_output=True,
             text=True,
             env=dict(os.environ),

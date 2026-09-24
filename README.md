@@ -293,7 +293,7 @@ El traslape entre tiles (Módulo 2) hace que una misma planta aparezca en tiles 
 - Se ordenan las cajas por confianza descendente (empates: orden de aparición — determinista, sin RNG).
 - Se conserva una caja si su IoU con TODAS las ya conservadas es `< --iou` (default 0.5); si IoU `≥ 0.5` se considera la misma planta y se descarta.
 - `global_count` = cajas conservadas; `box_count` = detecciones que pasaron el filtro de clase+confianza; `dedup_removed = box_count − global_count`.
-- `source_tiles` = lista ordenada de los tiles que aportaron ≥ 1 caja conservada (semantic: los dos tiles de una planta duplicada aparecen listados, FR-4).
+- `source_tiles` = lista ordenada de los tiles que aportaron detecciones al pool pre-dedup de la foto (aunque todas sus cajas hayan sido suprimidas por NMS — semantic: los dos tiles de una planta duplicada aparecen listados, FR-4).
 
 El CSV usa el header exacto `flight,photo,global_count,box_count,dedup_removed,source_tiles`, una fila por foto, ordenadas por `(flight, photo)`.
 
