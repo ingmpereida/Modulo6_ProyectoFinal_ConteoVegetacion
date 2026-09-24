@@ -8,6 +8,8 @@ module is a plain importable library — no CLI, no YOLO runtime.
 
 import dataclasses
 import io
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1130,3 +1132,207 @@ class TestMainRun:
         )
         assert rc == 1
         assert out.read_text(encoding="utf-8") == "sentinel\n"
+
+
+# ---------------------------------------------------------------------------
+# PR3 3.6: subprocess CLI contract — run the real `python infer.py` end-to-end
+# ---------------------------------------------------------------------------
+
+
+def _run_infer(args, env=None):
+    """Run the real infer.py CLI in a subprocess; return a CompletedProcess.
+
+    Uses sys.executable so the child sees the same interpreter (and the same
+    installed numpy/PIL) as the pytest run; infer.py is addressed by absolute
+    path so result never depends on the runner's cwd.
+    """
+    full_env = dict(os.environ)
+    if env:
+        full_env.update(env)
+    return subprocess.run(
+        [sys.executable, str(Path(infer.__file__).resolve()), *args],
+        capture_output=True,
+        text=True,
+        env=full_env,
+    )
+
+
+def _stub_env(root):
+    """Env with ``root`` first on PYTHONPATH so `from ultralytics import YOLO`
+    resolves to the fake package written under ``root``."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def _write_fake_ultralytics(root, pinned):
+    """Create a stub ``ultralytics`` package importable via PYTHONPATH.
+
+    ``pinned`` maps the tile's first-pixel red-byte marker (the same stable
+    marker contract as conftest.FakeModel) to canned detections
+    ``[{xyxy, conf, cls}]``. The stub exposes ``YOLO`` whose ``predict()``
+    returns one ``_Results`` with numpy ``xyxy/conf/cls`` arrays and a
+    ``names`` dict — exactly the shape ``_UltralyticsPredictor`` consumes.
+    """
+    pkg = root / "ultralytics"
+    pkg.mkdir(parents=True)
+    entries = ", ".join(f"{marker}: {dets!r}" for marker, dets in pinned.items())
+    (pkg / "__init__.py").write_text(
+        "import numpy as np\n"
+        f"PINNED = {{{entries}}}\n"
+        "class _Boxes:\n"
+        "    def __init__(self, xyxy, conf, cls):\n"
+        "        self.xyxy = np.array(xyxy, dtype=float)\n"
+        "        self.conf = np.array(conf, dtype=float)\n"
+        "        self.cls = np.array(cls, dtype=int)\n"
+        "class _Results:\n"
+        "    def __init__(self, xyxy, conf, cls):\n"
+        "        self.boxes = _Boxes(xyxy, conf, cls)\n"
+        "        self.names = {0: 'plant'}\n"
+        "class YOLO:\n"
+        "    def __init__(self, weights):\n"
+        "        self.weights = weights\n"
+        "    def predict(self, image):\n"
+        "        dets = PINNED.get(int(image[0, 0, 0]), [])\n"
+        "        return [_Results(\n"
+        "            [d['xyxy'] for d in dets],\n"
+        "            [d['conf'] for d in dets],\n"
+        "            [d['cls'] for d in dets],\n"
+        "        )]\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+class TestSubprocessCli:
+    """Real-process CLI contract (PR3 3.6).
+
+    ultralytics is NOT installed in this environment (verified), so the
+    ``--help`` and every exit-code-2 path must work with no stub on
+    PYTHONPATH — direct proof of NFR-1 (lazy import inside load_model).
+    Success paths use the fake ultralytics package written under tmp_path so
+    load_model() resolves the real seam end-to-end.
+    """
+
+    def test_help_exits_zero_without_ultralytics(self):
+        proc = _run_infer(["--help"])
+        assert proc.returncode == 0
+        for flag in (
+            "--weights",
+            "--input",
+            "--output",
+            "--conf",
+            "--iou",
+            "--summary",
+            "--verbose",
+        ):
+            assert flag in proc.stdout
+
+    def test_bad_weights_nonexistent_path_exits_2(self, tmp_path):
+        missing = tmp_path / "missing.pt"
+        proc = _run_infer(
+            ["--weights", str(missing), "--input", "x", "--output", "o.csv"]
+        )
+        assert proc.returncode == 2
+        assert str(missing) in proc.stderr
+
+    def test_bad_weights_directory_path_exits_2(self, tmp_path):
+        proc = _run_infer(
+            ["--weights", str(tmp_path), "--input", "x", "--output", "o.csv"]
+        )
+        assert proc.returncode == 2
+        assert str(tmp_path) in proc.stderr
+
+    @pytest.mark.parametrize("extra_args", [["--conf", "2"], ["--iou", "0"]])
+    def test_out_of_range_conf_or_iou_exits_2(self, tmp_path, extra_args):
+        (tmp_path / "w.pt").write_bytes(b"x")
+        args = [
+            "--weights",
+            str(tmp_path / "w.pt"),
+            "--input",
+            "x",
+            "--output",
+            "o.csv",
+        ] + extra_args
+        proc = _run_infer(args)
+        assert proc.returncode == 2
+
+    def test_directory_without_manifest_exits_1_and_writes_nothing(self, tmp_path):
+        empty = tmp_path / "input"
+        empty.mkdir()
+        (tmp_path / "w.pt").write_bytes(b"x")
+        out = tmp_path / "counts.csv"
+        proc = _run_infer(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(empty),
+                "--output",
+                str(out),
+            ]
+        )
+        assert proc.returncode == 1
+        assert not out.exists()
+        assert "manifest.csv" in proc.stderr
+
+    def _f2_success_args(self, tmp_path, make_tile_input):
+        """Build the F2 duplicate-tiles success run; return (args, env, out)."""
+        make_tile_input(
+            [
+                {
+                    "flight": "F2",
+                    "photo": "DJI_0002.JPG",
+                    "photo_w": 960,
+                    "photo_h": 640,
+                    "tiles": [
+                        ("t1.png", 0, 0, 640, 640, 11),
+                        ("t2.png", 320, 0, 640, 640, 12),
+                    ],
+                }
+            ]
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        stub = _write_fake_ultralytics(
+            tmp_path / "stub",
+            {
+                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
+                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
+            },
+        )
+        out = tmp_path / "counts.csv"
+        args = [
+            "--weights",
+            str(tmp_path / "w.pt"),
+            "--input",
+            str(tmp_path),
+            "--output",
+            str(out),
+            "--summary",
+            "--verbose",
+        ]
+        return args, _stub_env(stub), out
+
+    def test_successful_directory_mode_writes_exact_csv_and_pins(
+        self, tmp_path, make_tile_input
+    ):
+        args, env, out = self._f2_success_args(tmp_path, make_tile_input)
+        proc = _run_infer(args, env=env)
+        assert proc.returncode == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+            "F2,DJI_0002.JPG,1,2,1,t1.png;t2.png\n"
+        )
+        assert "summary flight=F2 photos=1 plants=1" in proc.stdout
+        assert (
+            "verbose flight=F2 photo=DJI_0002.JPG tiles=2 boxes=2 kept=1"
+            in proc.stdout
+        )
+
+    def test_rerun_is_byte_identical(self, tmp_path, make_tile_input):
+        args, env, out = self._f2_success_args(tmp_path, make_tile_input)
+        first = _run_infer(args, env=env)
+        first_bytes = out.read_bytes()
+        second = _run_infer(args, env=env)
+        assert first.returncode == second.returncode == 0
+        assert out.read_bytes() == first_bytes  # NFR-3: identical inputs -> identical bytes
