@@ -1,9 +1,14 @@
-"""Tests for infer.py pure geometry core (PR1: tasks 1.1-1.6).
+"""Tests for infer.py — geometry core, counting pipeline, CLI, and gates.
 
-Covers the pixel-space xyxy Box contract, class+conf filtering, offset
-projection, photo-bound clipping, IoU, and deterministic global NMS dedup.
-CPU-only and ultralytics-free by design (NFR-1, NFR-2): in this PR the
-module is a plain importable library — no CLI, no YOLO runtime.
+Spans the full module as shipped across PR1-PR3: the pixel-space xyxy Box
+contract with class+conf filtering, offset projection, photo-bound
+clipping, IoU, and deterministic global NMS dedup; the manifest-driven
+counting pipeline (read_tiles/count_photo/render) over real Pillow-decoded
+tiles via FakeModel; the main() CLI contract through unit tests and real
+subprocess runs against a fake ultralytics package (PYTHONPATH stub); and
+the PR1/PR2/PR3 source-scan + determinism gates. CPU-only and
+ultralytics-free by design (NFR-1, NFR-2) — the YOLO runtime is never
+imported at module level; the seam is load_model's lazy import.
 """
 
 import dataclasses
@@ -1540,14 +1545,10 @@ class TestSubprocessCli:
         assert not out.exists()
         assert "manifest.csv" in proc.stderr
 
-    def _f2_success_args(self, tmp_path, make_tile_input):
-        """Build the F2 duplicate-tiles success run; return (args, env, out)."""
-        return _f2_subprocess_fixture(tmp_path, make_tile_input)
-
     def test_successful_directory_mode_writes_exact_csv_and_pins(
         self, tmp_path, make_tile_input
     ):
-        args, env, out = self._f2_success_args(tmp_path, make_tile_input)
+        args, env, out = _f2_subprocess_fixture(tmp_path, make_tile_input)
         proc = _run_infer(args, env=env)
         assert proc.returncode == 0
         assert out.read_text(encoding="utf-8") == (
@@ -1647,14 +1648,6 @@ class TestSubprocessCli:
             "verbose flight=F9 photo=DJI_0009.JPG tiles=1 boxes=0 kept=0"
             in proc.stdout
         )
-
-    def test_rerun_is_byte_identical(self, tmp_path, make_tile_input):
-        args, env, out = self._f2_success_args(tmp_path, make_tile_input)
-        first = _run_infer(args, env=env)
-        first_bytes = out.read_bytes()
-        second = _run_infer(args, env=env)
-        assert first.returncode == second.returncode == 0
-        assert out.read_bytes() == first_bytes  # NFR-3: identical inputs -> identical bytes
 
 
 # ---------------------------------------------------------------------------
