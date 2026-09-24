@@ -241,7 +241,63 @@ def write_layout(
 
 
 def main(argv: list[str] | None = None) -> int:
-    raise NotImplementedError  # placeholder; CLI lands with tasks 2.11-2.12
+    """CLI entry point (FR-4). Returns the process exit code.
+
+    0 = success; 1 = invalid input / dataset error (nothing written);
+    2 = usage error (--valid-ratio out of range; argparse itself exits 2 on
+    missing required arguments).
+    """
+    parser = argparse.ArgumentParser(
+        prog="prepare_dataset.py",
+        description="Build a YOLO dataset from tile_pipeline.py tiles and labels.",
+    )
+    parser.add_argument("--manifest", required=True, help="path to tile_pipeline.py manifest.csv")
+    parser.add_argument(
+        "--labels",
+        required=True,
+        help="tiles root with per-flight image and label folders",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="dataset output directory (overwritten deterministically on rerun)",
+    )
+    parser.add_argument(
+        "--valid-ratio",
+        type=float,
+        default=DEFAULT_VALID_RATIO,
+        help="validation fraction per flight, in (0, 1) (default: 0.2)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="random seed for reproducible splits (default: 42)",
+    )
+    args = parser.parse_args(argv)
+
+    if not 0.0 < args.valid_ratio < 1.0:
+        print(f"Error: --valid-ratio must be in (0, 1), got {args.valid_ratio}", file=sys.stderr)
+        return 2
+
+    try:
+        summary = write_layout(
+            manifest_path=Path(args.manifest),
+            labels_root=Path(args.labels),
+            output_dir=Path(args.output),
+            valid_ratio=args.valid_ratio,
+            seed=args.seed,
+        )
+    except (DatasetError, LabelFormatError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Dataset ready: {summary['train_images']} train / {summary['valid_images']} valid "
+        f"images across {summary['flights']} flights "
+        f"({summary['background_images']} background, image-only)."
+    )
+    return 0
 
 
 if __name__ == "__main__":
