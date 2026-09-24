@@ -11,6 +11,10 @@ node_modules/
 runs/
 datasets/
 
+# Raw drone photos and tile output (tile_pipeline.py input/output)
+fotos_dron/
+tiles/
+
 # Tooling caches
 .pytest_cache/
 .codegraph/
