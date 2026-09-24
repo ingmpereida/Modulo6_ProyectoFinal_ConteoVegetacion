@@ -373,3 +373,59 @@ class TestLoadImage:
     def test_missing_file_raises_file_not_found_error(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             infer.load_image(tmp_path / "missing.png")
+
+
+# ---------------------------------------------------------------------------
+# PR2 2.4: FakeModel predictor + make_tile_input real-image layout (conftest)
+# ---------------------------------------------------------------------------
+
+
+class TestFakeModel:
+    def test_predict_returns_canned_boxes_keyed_on_first_pixel_byte(self):
+        from conftest import FakeModel
+
+        model = FakeModel({5: [{"xyxy": [0, 0, 10, 10], "conf": 0.9, "cls": 0}]})
+        out = model.predict(np.full((4, 4, 3), 5, dtype=np.uint8))
+        assert out == [{"xyxy": [0, 0, 10, 10], "conf": 0.9, "cls": 0}]
+
+    def test_unknown_marker_yields_no_detections(self):
+        from conftest import FakeModel
+
+        model = FakeModel({5: [{"xyxy": [0, 0, 10, 10], "conf": 0.9, "cls": 0}]})
+        assert model.predict(np.full((2, 2, 3), 9, dtype=np.uint8)) == []
+
+
+class TestMakeTileInput:
+    def test_builds_real_decodable_tiles_and_manifest(self, make_tile_input):
+        manifest, tiles_root = make_tile_input(
+            [
+                {
+                    "flight": "F1",
+                    "photo": "DJI_0001.JPG",
+                    "photo_w": 1280,
+                    "photo_h": 800,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 1), ("t4.png", 0, 640, 640, 160, 4)],
+                }
+            ]
+        )
+        assert manifest.is_file()
+        assert (tiles_root / "F1" / "t1.png").is_file()
+        assert infer.load_image(tiles_root / "F1" / "t1.png").shape == (640, 640, 3)
+
+    def test_tiles_carry_distinct_stable_markers(self, make_tile_input):
+        manifest, tiles_root = make_tile_input(
+            [
+                {
+                    "flight": "F1",
+                    "photo": "DJI_0001.JPG",
+                    "photo_w": 1280,
+                    "photo_h": 800,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 1), ("t2.png", 320, 0, 640, 640, 2)],
+                }
+            ]
+        )
+        markers = [
+            int(infer.load_image(tiles_root / "F1" / name)[0, 0, 0])
+            for name in ("t1.png", "t2.png")
+        ]
+        assert markers == [1, 2]

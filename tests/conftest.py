@@ -11,6 +11,7 @@ import csv
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 # Columns written by tile_pipeline.py (see its manifest.csv contract).
 MANIFEST_FIELDS = [
@@ -103,3 +104,68 @@ def single_flight(make_flight_layout):
         }
     }
     return make_flight_layout(flights)
+
+
+# ---------------------------------------------------------------------------
+# yolo-inference PR2: FakeModel predictor + real-image tile layout fixtures
+# (append-only — the counting pipeline needs REAL decodable images, so these
+# tiles are PNGs written with Pillow; dummy bytes would not survive the PIL
+# decode inside load_image.)
+# ---------------------------------------------------------------------------
+
+
+class FakeModel:
+    """Predictor duck-type (FR-6): canned {xyxy, conf, cls} keyed on image[0, 0, 0].
+
+    The marker is the first pixel's red byte — a stable value through the
+    lossless PNG/TIF decode path, unlike hash() (salted per process, NFR-2).
+    A tile whose marker has no canned entry produces no detections.
+    """
+
+    def __init__(self, detections):
+        self._detections = dict(detections)
+
+    def predict(self, image):
+        marker = int(image[0, 0, 0])
+        return [dict(box) for box in self._detections.get(marker, [])]
+
+
+@pytest.fixture
+def make_tile_input(tmp_path):
+    """Factory building real PNG tiles + manifest.csv for count_photo tests.
+
+    entries: list[dict] with flight, photo, photo_w, photo_h and tiles=[(
+    name, x_offset, y_offset, tile_w, tile_h, marker)] — each tile is a solid
+    (marker, 0, 0) PNG at tiles_root/flight/name, recorded in one manifest row
+    with the same 9 columns as tile_pipeline.py. Returns (manifest, tiles_root).
+    """
+
+    def _make(entries):
+        tiles_root = tmp_path / "tiles"
+        rows = []
+        for entry in entries:
+            for name, x_off, y_off, t_w, t_h, marker in entry["tiles"]:
+                tile_path = tiles_root / entry["flight"] / name
+                tile_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (t_w, t_h), (marker, 0, 0)).save(tile_path)
+                rows.append(
+                    {
+                        "vuelo": entry["flight"],
+                        "imagen_origen": entry["photo"],
+                        "tile": name,
+                        "x_offset": x_off,
+                        "y_offset": y_off,
+                        "tile_w": t_w,
+                        "tile_h": t_h,
+                        "imagen_ancho": entry["photo_w"],
+                        "imagen_alto": entry["photo_h"],
+                    }
+                )
+        manifest = tmp_path / "manifest.csv"
+        with manifest.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=MANIFEST_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        return manifest, tiles_root
+
+    return _make
