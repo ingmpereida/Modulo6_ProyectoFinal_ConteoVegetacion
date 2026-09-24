@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Machine learning artifacts (train.py / prepare_dataset.py output)
+runs/
+datasets/
+
+# Tooling caches
+.pytest_cache/
+.codegraph/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
