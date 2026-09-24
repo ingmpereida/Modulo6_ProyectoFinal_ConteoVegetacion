@@ -241,3 +241,20 @@ class TestNmsDedup:
         ]
         kept = infer.nms_dedup(boxes, 0.5)
         assert [k.conf for k in kept] == [0.9, 0.8, 0.7]
+
+
+# ---------------------------------------------------------------------------
+# PR1 1.6: gate — importable library only, ultralytics-free (NFR-1, NFR-2)
+# ---------------------------------------------------------------------------
+
+
+class TestPr1Gate:
+    def test_source_never_imports_ultralytics(self):
+        src = Path(infer.__file__).read_text(encoding="utf-8")
+        assert "ultralytics" not in src
+
+    def test_source_is_importable_library_without_cli(self):
+        src = Path(infer.__file__).read_text(encoding="utf-8")
+        assert "argparse" not in src
+        assert "__main__" not in src
+        assert "sys.exit" not in src

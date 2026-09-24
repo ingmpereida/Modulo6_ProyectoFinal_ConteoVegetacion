@@ -4,9 +4,9 @@
 This PR ships the importable geometry core only: the pixel-space xyxy Box
 contract plus the filter/project/clip/IoU/NMS helpers used by the counting
 pipeline. Everything here is pure and deterministic (NFR-2) and consumes the
-predictor duck-type `predict(image) -> [Box]`, so no YOLO runtime is needed
-to import or test this module (NFR-1). The ultralytics seam, photo pipeline,
-and argparse CLI arrive in PR2/PR3.
+predictor duck-type `predict(image) -> [Box]`, so the heavy detector runtime
+is never needed to import or test this module (NFR-1). The detector seam,
+the photo orchestration, and the command-line entry point land in PR2/PR3.
 """
 
 from dataclasses import dataclass
