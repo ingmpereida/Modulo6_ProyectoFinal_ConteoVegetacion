@@ -1,5 +1,11 @@
 # Conteo de Vegetación con IA — Documentación del Proyecto
 
+**Dr. Francisco J. Rodríguez**
+Integrantes del Equipo:
+* Héctor Hugo Domínguez Jaime.
+* Sergio Raúl Bonilla Alejo
+* César Geovanni Machuca Pereida
+
 Proyecto final del Módulo 6: pipeline de visión por computadora para **contar plantas en parcelas agrícolas** a partir de fotos de dron o celular. El objetivo del sistema es estimar la densidad de vegetación (especialmente en etapas de emergencia, donde las plantas son pequeñas y dispersas), primero con procesamiento clásico de color y, en fases posteriores, con un modelo entrenado.
 
 Este README está escrito para que **una IA o una persona pueda entender el proyecto y continuar el trabajo sin re-descubrir nada**. Léelo completo antes de modificar código.
