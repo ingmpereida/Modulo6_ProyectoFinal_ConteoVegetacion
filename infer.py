@@ -248,3 +248,46 @@ def count_photo(
         dedup_removed=box_count - global_count,
         source_tiles=source_tiles,
     )
+
+
+CSV_FIELDS = [
+    "flight",
+    "photo",
+    "global_count",
+    "box_count",
+    "dedup_removed",
+    "source_tiles",
+]
+
+
+def render_csv(rows: list[dict]) -> str:
+    """Render counting rows to deterministic CSV text (FR-5, NFR-3).
+
+    Exact header (flight,photo,global_count,box_count,dedup_removed,
+    source_tiles), rows sorted by (flight, photo), ``source_tiles`` joined
+    with ';'. Pure string output — the caller decides when to write it (D7).
+    """
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    for row in sorted(rows, key=lambda r: (r["flight"], r["photo"])):
+        out = dict(row)
+        out["source_tiles"] = ";".join(row["source_tiles"])
+        writer.writerow(out)
+    return buf.getvalue()
+
+
+def render_summaries(rows: list[dict]) -> list[str]:
+    """Per-flight summary lines in a PINNED format (finding 6; PR3 asserts):
+    ``summary flight={flight} photos={n} plants={sum(global_count)}`` over
+    rows sorted by (flight, photo), flights in first-seen order.
+    """
+    summaries: list[str] = []
+    ordered = sorted(rows, key=lambda r: (r["flight"], r["photo"]))
+    for flight, group in itertools.groupby(ordered, key=lambda r: r["flight"]):
+        group_rows = list(group)
+        summaries.append(
+            f"summary flight={flight} photos={len(group_rows)} "
+            f"plants={sum(r['global_count'] for r in group_rows)}"
+        )
+    return summaries

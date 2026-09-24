@@ -606,3 +606,77 @@ class TestCountPhoto:
     def test_empty_tiles_raise_value_error(self):
         with pytest.raises(ValueError):
             infer.count_photo([], infer.load_image, lambda img: [], 0.25, 0.5)
+
+
+# ---------------------------------------------------------------------------
+# PR2 2.6: render_csv — deterministic CSV text (FR-5, NFR-3)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderCsv:
+    def test_exact_header_and_byte_exact_row(self):
+        rows = [
+            {
+                "flight": "F1",
+                "photo": "a.JPG",
+                "global_count": 2,
+                "box_count": 3,
+                "dedup_removed": 1,
+                "source_tiles": ("t1.png", "t2.png"),
+            }
+        ]
+        expected = (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+            "F1,a.JPG,2,3,1,t1.png;t2.png\n"
+        )
+        assert infer.render_csv(rows) == expected
+
+    def test_rows_are_sorted_by_flight_then_photo(self):
+        rows = [
+            {"flight": "B", "photo": "b2.JPG", "global_count": 1, "box_count": 1, "dedup_removed": 0, "source_tiles": ("x.png",)},
+            {"flight": "A", "photo": "a2.JPG", "global_count": 4, "box_count": 4, "dedup_removed": 0, "source_tiles": ("y.png",)},
+            {"flight": "A", "photo": "a1.JPG", "global_count": 2, "box_count": 2, "dedup_removed": 0, "source_tiles": ("z.png",)},
+        ]
+        lines = infer.render_csv(rows).strip().split("\n")[1:]
+        assert lines[0].startswith("A,a1.JPG,")
+        assert lines[1].startswith("A,a2.JPG,")
+        assert lines[2].startswith("B,b2.JPG,")
+
+    def test_semicolon_join_is_deterministic(self):
+        row = {"flight": "F", "photo": "p.JPG", "global_count": 1, "box_count": 1, "dedup_removed": 0, "source_tiles": ("t2.png", "t1.png")}
+        csv_text = infer.render_csv([row])
+        assert "t2.png;t1.png" in csv_text  # join preserves the tuple order
+        assert csv_text == infer.render_csv([row])  # byte-identical rerun
+
+    def test_empty_rows_renders_header_only(self):
+        assert infer.render_csv([]) == "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+
+
+# ---------------------------------------------------------------------------
+# PR2 2.7: render_summaries — pinned per-flight summary lines (finding 6)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderSummaries:
+    def test_pinned_line_format_with_photo_counts_and_plant_sums(self):
+        rows = [
+            {"flight": "B", "photo": "b1.JPG", "global_count": 2, "box_count": 2, "dedup_removed": 0, "source_tiles": ()},
+            {"flight": "A", "photo": "a1.JPG", "global_count": 1, "box_count": 1, "dedup_removed": 0, "source_tiles": ()},
+            {"flight": "A", "photo": "a2.JPG", "global_count": 4, "box_count": 4, "dedup_removed": 0, "source_tiles": ()},
+        ]
+        assert infer.render_summaries(rows) == [
+            "summary flight=A photos=2 plants=5",
+            "summary flight=B photos=1 plants=2",
+        ]
+
+    def test_flight_order_is_first_seen_over_sorted_rows(self):
+        rows = [
+            {"flight": "Z", "photo": "z.JPG", "global_count": 1, "box_count": 1, "dedup_removed": 0, "source_tiles": ()},
+            {"flight": "A", "photo": "a.JPG", "global_count": 1, "box_count": 1, "dedup_removed": 0, "source_tiles": ()},
+        ]
+        lines = infer.render_summaries(rows)
+        assert lines[0].startswith("summary flight=A")
+        assert lines[1].startswith("summary flight=Z")
+
+    def test_empty_rows_yield_no_lines(self):
+        assert infer.render_summaries([]) == []
