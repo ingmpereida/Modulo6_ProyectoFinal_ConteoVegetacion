@@ -1,24 +1,41 @@
 #!/usr/bin/env python3
-"""infer.py — batch plant counting from YOLO predictions (PR1: pure core).
+"""infer.py — batch plant counting from YOLO predictions.
 
-This PR ships the importable geometry core only: the pixel-space xyxy Box
-contract plus the filter/project/clip/IoU/NMS helpers used by the counting
-pipeline. Everything here is pure and deterministic (NFR-2) and consumes the
-predictor duck-type `predict(image) -> [Box]`, so the heavy detector runtime
-is never needed to import or test this module (NFR-1). The detector seam,
-the photo orchestration, and the command-line entry point land in PR2/PR3.
+PR1 shipped the importable geometry core: the pixel-space xyxy Box contract
+plus the filter/project/clip/IoU/NMS helpers used by the counting pipeline.
+PR2 layers the counting pipeline on top: manifest-driven tile specs, PIL
+image loading (PNG/JPEG/TIF -> RGB numpy arrays), the per-photo counting
+orchestration, and deterministic CSV/summary rendering. Everything stays
+pure and deterministic (NFR-2) and consumes the predictor duck-type
+`predict(image) -> [Box]`, so the heavy detector runtime is never needed to
+import or test this module (NFR-1). The detector seam and the command-line
+entry point land in PR3.
 """
 
+import csv
+import io
+import itertools
 from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
 
 
 __all__ = [
     "Box",
+    "TileSpec",
+    "PhotoResult",
     "filter_boxes",
     "project_box",
     "clip_box",
     "box_iou",
     "nms_dedup",
+    "load_image",
+    "read_tiles",
+    "count_photo",
+    "render_csv",
+    "render_summaries",
 ]
 
 
@@ -111,3 +128,51 @@ def nms_dedup(boxes: list[Box], iou: float) -> list[Box]:
         if all(box_iou(box, kept_box) < iou for kept_box in kept):
             kept.append(box)
     return kept
+
+
+@dataclass(frozen=True)
+class TileSpec:
+    """One manifest row: a tile image and where it sits inside its photo.
+
+    ``path`` lives under ``tiles_root / flight`` (tile_pipeline.py layout);
+    offsets and dims come from the manifest columns verbatim (D9). Photo
+    bounds are needed by clip_box (D5) and come from the photo columns.
+    """
+
+    path: Path
+    flight: str
+    photo: str
+    x_offset: int
+    y_offset: int
+    tile_w: int
+    tile_h: int
+    photo_w: int
+    photo_h: int
+
+
+@dataclass(frozen=True)
+class PhotoResult:
+    """Count outcome for one photo after per-photo global NMS dedup (FR-4)."""
+
+    global_count: int
+    box_count: int
+    dedup_removed: int
+    source_tiles: tuple[str, ...]
+
+
+def load_image(path: Path | str) -> np.ndarray:
+    """Decode any Pillow-readable image (PNG/JPEG/TIF) to RGB H×W×3 uint8.
+
+    The predictor duck-type consumes exactly this array shape (FR-6), and
+    the decode never touches the heavy detector runtime (NFR-1). A missing
+    file raises FileNotFoundError; an existing file that cannot be decoded
+    as an image raises ValueError.
+    """
+    img_path = Path(path)
+    if not img_path.is_file():
+        raise FileNotFoundError(f"image file not found: {img_path}")
+    try:
+        with Image.open(img_path) as img:
+            return np.asarray(img.convert("RGB"), dtype=np.uint8)
+    except (ValueError, OSError) as exc:
+        raise ValueError(f"cannot decode image: {img_path}") from exc

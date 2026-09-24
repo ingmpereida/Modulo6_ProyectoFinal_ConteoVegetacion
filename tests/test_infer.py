@@ -7,10 +7,13 @@ module is a plain importable library — no CLI, no YOLO runtime.
 """
 
 import dataclasses
+import io
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
+from PIL import Image
 
 import infer
 
@@ -258,3 +261,171 @@ class TestPr1Gate:
         assert "argparse" not in src
         assert "__main__" not in src
         assert "sys.exit" not in src
+
+
+# ---------------------------------------------------------------------------
+# PR2 2.1: TileSpec + PhotoResult types
+# ---------------------------------------------------------------------------
+
+
+class TestTileSpec:
+    def test_carries_path_flight_photo_and_layout_fields(self):
+        spec = infer.TileSpec(
+            path=Path("tiles/F1/t1.png"),
+            flight="F1",
+            photo="DJI_0001.JPG",
+            x_offset=320,
+            y_offset=0,
+            tile_w=640,
+            tile_h=640,
+            photo_w=1280,
+            photo_h=800,
+        )
+        assert spec.path == Path("tiles/F1/t1.png")
+        assert spec.flight == "F1"
+        assert spec.photo == "DJI_0001.JPG"
+        assert (spec.x_offset, spec.y_offset) == (320, 0)
+        assert (spec.tile_w, spec.tile_h) == (640, 640)
+        assert (spec.photo_w, spec.photo_h) == (1280, 800)
+
+    def test_is_frozen_and_rejects_mutation(self):
+        spec = infer.TileSpec(Path("t.png"), "F", "p.jpg", 0, 0, 640, 640, 4000, 3000)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            spec.x_offset = 999
+        assert spec.x_offset == 0
+
+
+class TestPhotoResult:
+    def test_carries_count_fields_and_source_tiles_tuple(self):
+        result = infer.PhotoResult(
+            global_count=1, box_count=2, dedup_removed=1,
+            source_tiles=("t1.png", "t2.png"),
+        )
+        assert result.global_count == 1
+        assert result.box_count == 2
+        assert result.dedup_removed == 1
+        assert result.source_tiles == ("t1.png", "t2.png")
+
+    def test_is_frozen_and_rejects_mutation(self):
+        result = infer.PhotoResult(3, 4, 1, ("a.png",))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.global_count = 99
+        assert result.global_count == 3
+
+
+# ---------------------------------------------------------------------------
+# PR2 2.2: load_image — PIL decode to RGB uint8 numpy array (no ultralytics)
+# ---------------------------------------------------------------------------
+
+
+def _image_bytes(fmt, mode, size, color):
+    """Render a tiny real image with Pillow so load_image has a decodable file."""
+    buf = io.BytesIO()
+    Image.new(mode, size, color).save(buf, format=fmt)
+    return buf.getvalue()
+
+
+class TestLoadImage:
+    def test_loads_png_as_rgb_uint8_array(self, tmp_path):
+        path = tmp_path / "tile.png"
+        path.write_bytes(_image_bytes("PNG", "RGB", (2, 3), (7, 8, 9)))
+        arr = infer.load_image(path)
+        assert isinstance(arr, np.ndarray)
+        assert arr.shape == (3, 2, 3)  # H, W, 3
+        assert arr.dtype == np.uint8
+        assert arr[0, 0].tolist() == [7, 8, 9]
+        assert arr[2, 1].tolist() == [7, 8, 9]
+
+    def test_loads_tif_as_rgb_uint8_array(self, tmp_path):
+        path = tmp_path / "tile.tif"
+        path.write_bytes(_image_bytes("TIFF", "RGB", (2, 2), (200, 100, 50)))
+        arr = infer.load_image(path)
+        assert arr.shape == (2, 2, 3)
+        assert arr.dtype == np.uint8
+        assert arr[0, 0].tolist() == [200, 100, 50]
+
+    def test_loads_jpeg_as_rgb_uint8_array(self, tmp_path):
+        path = tmp_path / "tile.jpg"
+        path.write_bytes(_image_bytes("JPEG", "RGB", (5, 4), (10, 20, 30)))
+        arr = infer.load_image(path)
+        assert isinstance(arr, np.ndarray)
+        assert arr.shape == (4, 5, 3)  # JPEG is lossy — assert shape/dtype only
+        assert arr.dtype == np.uint8
+
+    def test_grayscale_and_rgba_are_converted_to_three_channels(self, tmp_path):
+        gray = tmp_path / "gray.png"
+        gray.write_bytes(_image_bytes("PNG", "L", (3, 2), 128))
+        arr = infer.load_image(gray)
+        assert arr.shape == (2, 3, 3)
+        assert arr[0, 0].tolist() == [128, 128, 128]
+        rgba = tmp_path / "rgba.png"
+        rgba.write_bytes(_image_bytes("PNG", "RGBA", (2, 2), (10, 20, 30, 255)))
+        arr2 = infer.load_image(rgba)
+        assert arr2.shape == (2, 2, 3)
+        assert arr2[0, 0].tolist() == [10, 20, 30]
+
+    def test_non_image_file_raises_value_error(self, tmp_path):
+        path = tmp_path / "not_an_image.png"
+        path.write_bytes(b"definitely not image bytes")
+        with pytest.raises(ValueError):
+            infer.load_image(path)
+
+    def test_missing_file_raises_file_not_found_error(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            infer.load_image(tmp_path / "missing.png")
+
+
+# ---------------------------------------------------------------------------
+# PR2 2.4: FakeModel predictor + make_tile_input real-image layout (conftest)
+# ---------------------------------------------------------------------------
+
+
+class TestFakeModel:
+    def test_predict_returns_canned_boxes_keyed_on_first_pixel_byte(self):
+        from conftest import FakeModel
+
+        model = FakeModel({5: [{"xyxy": [0, 0, 10, 10], "conf": 0.9, "cls": 0}]})
+        out = model.predict(np.full((4, 4, 3), 5, dtype=np.uint8))
+        assert out == [{"xyxy": [0, 0, 10, 10], "conf": 0.9, "cls": 0}]
+
+    def test_unknown_marker_yields_no_detections(self):
+        from conftest import FakeModel
+
+        model = FakeModel({5: [{"xyxy": [0, 0, 10, 10], "conf": 0.9, "cls": 0}]})
+        assert model.predict(np.full((2, 2, 3), 9, dtype=np.uint8)) == []
+
+
+class TestMakeTileInput:
+    def test_builds_real_decodable_tiles_and_manifest(self, make_tile_input):
+        manifest, tiles_root = make_tile_input(
+            [
+                {
+                    "flight": "F1",
+                    "photo": "DJI_0001.JPG",
+                    "photo_w": 1280,
+                    "photo_h": 800,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 1), ("t4.png", 0, 640, 640, 160, 4)],
+                }
+            ]
+        )
+        assert manifest.is_file()
+        assert (tiles_root / "F1" / "t1.png").is_file()
+        assert infer.load_image(tiles_root / "F1" / "t1.png").shape == (640, 640, 3)
+
+    def test_tiles_carry_distinct_stable_markers(self, make_tile_input):
+        manifest, tiles_root = make_tile_input(
+            [
+                {
+                    "flight": "F1",
+                    "photo": "DJI_0001.JPG",
+                    "photo_w": 1280,
+                    "photo_h": 800,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 1), ("t2.png", 320, 0, 640, 640, 2)],
+                }
+            ]
+        )
+        markers = [
+            int(infer.load_image(tiles_root / "F1" / name)[0, 0, 0])
+            for name in ("t1.png", "t2.png")
+        ]
+        assert markers == [1, 2]
