@@ -16,8 +16,9 @@ Este README está escrito para que **una IA o una persona pueda entender el proy
 | `tests/computeDetection.test.js` | Test automatizado de `computeDetection` (runner nativo de Node) | 8/8 pasando |
 | `package.json` | Script `npm test` para correr los tests | — |
 | `README.md` | Este documento | — |
+| Cambio `yolo-training-pipeline` (PR1–PR3) | Fase 2–3 — pipeline de entrenamiento YOLO: `prepare_dataset.py` (split por vuelo + `data.yaml`) y `train.py` (YOLO26, train + val + métricas) sobre los tiles de la Fase 2 | PR1 (git init + `.gitignore`) hecho; PR2/PR3 pendientes |
 
-El directorio **no es un repositorio git** todavía (por lo tanto no tiene `.gitignore`); la lógica de detección sí tiene tests automatizados — ver *Tests automatizados*.
+El repositorio **git** se inicializó con el PR1 del cambio `yolo-training-pipeline` (rama `feat/yolo-pr1-repo`, base de la cadena `feat/yolo-training-pipeline`, commits convencionales); `.gitignore` excluye artefactos generados (`runs/`, `datasets/`, venv, caches, `node_modules/`). La lógica de detección sí tiene tests automatizados — ver *Tests automatizados*.
 
 ---
 
@@ -187,7 +188,7 @@ Foto de dron (celular/dron/ortomosaico)
 | Comentarios en código | Mixto histórico (ES en `tile_pipeline.py`, EN en las secciones nuevas del HTML). Para código nuevo: inglés. |
 | Nombres de vuelo | `ParcelaX_YYYY-MM-DD_etapa` (ej. `ParcelaA_2026-09-10_emergencia`) |
 | Nombres de tile | `<foto_original>_x<offset_X 5 dígitos>_y<offset_Y 5 dígitos>.jpg` |
-| Commits | Conventional Commits (no existe repo todavía; respetar al inicializarlo) |
+| Commits | Conventional Commits (repo inicializado en el PR1 de `yolo-training-pipeline`; respetar el historial existente) |
 
 ---
 
@@ -235,8 +236,8 @@ python3 tile_pipeline.py --input ./fotos_dron --output ./tiles
 
 ## Roadmap y próximos pasos sugeridos
 
-1. Inicializar **git** (repo + commits conventionales) y añadir `.gitignore`.
-2. **Fase 2–3**: etiquetar tiles en Roboflow/CVAT usando el `manifest.csv` y entrenar el modelo para copas solapadas.
+1. ~~Inicializar **git** (repo + commits conventionales) y añadir `.gitignore`.~~ — **hecho** en el PR1 del cambio `yolo-training-pipeline`.
+2. **Fase 2–3** (cambio `yolo-training-pipeline`): etiquetar tiles en Roboflow/CVAT usando el `manifest.csv`; `prepare_dataset.py` con split por vuelo y `data.yaml` (PR2, pendiente) y `train.py` con YOLO26 + validación (PR3, pendiente) para copas solapadas.
 3. Optimización opcional: `OffscreenCanvas` dentro del worker para evitar el `getImageData`/transferencia en el hilo principal.
 
 ---
