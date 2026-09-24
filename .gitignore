@@ -11,6 +11,10 @@ node_modules/
 runs/
 datasets/
 
+# Weights / model checkpoints (downloaded or trained, gitignored)
+*.pt
+*.onnx
+
 # Raw drone photos and tile output (tile_pipeline.py input/output)
 fotos_dron/
 tiles/
