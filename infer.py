@@ -553,6 +553,14 @@ def main(argv: list[str] | None = None) -> int:
         groups: dict[tuple[str, str], list[TileSpec]] = {}
         for tile in tiles:
             groups.setdefault((tile.flight, tile.photo), []).append(tile)
+        if not groups:
+            # Empty manifest: not an error (R4-002) — header-only CSV is
+            # still written — but the silent success must be observable.
+            print(
+                f"warning: no photos in manifest {manifest}: header-only CSV "
+                "written (no rows produced)",
+                file=sys.stderr,
+            )
 
         rows: list[dict] = []
         for (flight, photo), photo_tiles in groups.items():

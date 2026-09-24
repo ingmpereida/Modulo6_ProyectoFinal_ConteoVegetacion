@@ -1322,6 +1322,39 @@ class TestMainRun:
         assert src != out
         assert src.parent == out.parent  # temp sibling lives in the same dir
 
+    def test_empty_manifest_run_warns_and_writes_header_only(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # R4-002: a directory-mode run with ZERO photos is NOT an error (exit
+        # 0, header-only CSV) but must warn on stderr naming the manifest.
+        (tmp_path / "tiles").mkdir()
+        manifest = tmp_path / "manifest.csv"
+        manifest.write_text(
+            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
+            "imagen_ancho,imagen_alto\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        monkeypatch.setattr(infer, "load_model", lambda weights: object())
+        out = tmp_path / "counts.csv"
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+        )
+        err = capsys.readouterr().err
+        assert "no photos in manifest" in err
+        assert str(manifest) in err
+
 
 # ---------------------------------------------------------------------------
 # PR3 3.6: subprocess CLI contract — run the real `python infer.py` end-to-end
@@ -1526,6 +1559,38 @@ class TestSubprocessCli:
             "verbose flight=F2 photo=DJI_0002.JPG tiles=2 boxes=2 kept=1"
             in proc.stdout
         )
+
+    def test_empty_manifest_warns_and_writes_header_only(self, tmp_path):
+        # R4-002: zero-photo directory run exits 0 and writes the header-only
+        # CSV, with a stderr warning naming the manifest (observable, not an
+        # error).
+        (tmp_path / "tiles").mkdir()
+        manifest = tmp_path / "manifest.csv"
+        manifest.write_text(
+            "vuelo,imagen_origen,tile,x_offset,y_offset,tile_w,tile_h,"
+            "imagen_ancho,imagen_alto\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        stub = _write_fake_ultralytics(tmp_path / "stub", {})
+        out = tmp_path / "counts.csv"
+        proc = _run_infer(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+            ],
+            env=_stub_env(stub),
+        )
+        assert proc.returncode == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+        )
+        assert "no photos in manifest" in proc.stderr
+        assert str(manifest) in proc.stderr
 
     def test_zero_detection_photo_yields_zero_row_and_does_not_abort(
         self, tmp_path, make_tile_input
