@@ -1,6 +1,12 @@
 # Reporte de Fases — Proyecto Conteo de Vegetación con IA
 
-Reporte técnico consolidado de las fases desarrolladas en el proyecto **Conteo de Vegetación con IA** (Proyecto Final — Módulo 6). Este documento está escrito para que **una persona o una IA** pueda comprender qué se construyó, por qué, con qué decisiones técnicas, y cómo continuar el trabajo.
+**Dr. Francisco J. Rodríguez**
+Integrantes del Equipo:
+* Héctor Hugo Domínguez Jaime.
+* Sergio Raúl Bonilla Alejo
+* César Geovanni Machuca Pereida
+
+Reporte técnico consolidado de las fases desarrolladas en el proyecto **Conteo de Vegetación con IA** (Proyecto Final — Módulo 6).
 
 > Fuentes primarias: `README.md` (referencia operativa completa), código fuente (`conteo_vegetacion.html`, `tile_pipeline.py`, `prepare_dataset.py`, `train.py`, `infer.py`, `convert_polygon_to_bbox.py`), suite de tests (`tests/`) y memoria persistente Engram (proyecto `proyectofinal-modulo6`). Si este reporte y el código discrepan, **el código manda**.
 
