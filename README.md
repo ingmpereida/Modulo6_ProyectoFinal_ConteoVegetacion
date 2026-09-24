@@ -297,6 +297,8 @@ El traslape entre tiles (Módulo 2) hace que una misma planta aparezca en tiles 
 
 El CSV usa el header exacto `flight,photo,global_count,box_count,dedup_removed,source_tiles`, una fila por foto, ordenadas por `(flight, photo)`.
 
+**Fotos sin detecciones no abortan la corrida**: si una foto no produce ninguna caja (ultralytics devuelve `boxes = None` en una foto vacía), `infer.py` escribe su fila con `global_count=0, box_count=0, dedup_removed=0` y `source_tiles` vacío, y continúa con el resto de las fotos. El conteo corre completo y termina con exit code 0.
+
 ---
 
 ## Flujo de datos completo (cómo encajan las piezas)

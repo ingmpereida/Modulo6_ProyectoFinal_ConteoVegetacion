@@ -808,6 +808,13 @@ class _FakeResults:
         self.boxes = _FakeBoxes(raw)
 
 
+class _NoDetectionsResult:
+    """An ultralytics-style result whose boxes attribute is None (zero detections)."""
+
+    def __init__(self):
+        self.boxes = None
+
+
 class _FakePredictorModel:
     """Model whose .predict returns canned ultralytics-style results."""
 
@@ -858,7 +865,19 @@ class TestUltralyticsAdapter:
         assert out[0]["conf"] == 0.9
         assert out[0]["cls"] == 0
 
-    def test_fails_fast_when_results_have_no_boxes(self):
+    def test_boxes_none_returns_empty_list(self):
+        # R4-001: ultralytics 8.4.x returns boxes=None for a photo with zero
+        # detections — empty photos are the NORM in plant counting, so this
+        # must yield an empty detection list, never a RuntimeError.
+        predictor = infer._UltralyticsPredictor(
+            _FakePredictorModel([_NoDetectionsResult()])
+        )
+        assert predictor.predict(np.zeros((4, 4, 3), dtype=np.uint8)) == []
+
+    def test_fails_fast_when_results_have_no_boxes_attribute(self):
+        # Drift guard: a result missing the boxes attribute entirely is NOT a
+        # valid ultralytics Results and still fails fast — only a real
+        # boxes=None (zero detections) is treated as empty (R4-001).
         class _NoBoxes:
             pass
 
@@ -1171,9 +1190,11 @@ def _write_fake_ultralytics(root, pinned):
 
     ``pinned`` maps the tile's first-pixel red-byte marker (the same stable
     marker contract as conftest.FakeModel) to canned detections
-    ``[{xyxy, conf, cls}]``. The stub exposes ``YOLO`` whose ``predict()``
-    returns one ``_Results`` with numpy ``xyxy/conf/cls`` arrays and a
-    ``names`` dict — exactly the shape ``_UltralyticsPredictor`` consumes.
+    ``[{xyxy, conf, cls}]`` — or ``None`` to simulate a zero-detection photo
+    (ultralytics returns ``boxes=None`` for it, R4-001). The stub exposes
+    ``YOLO`` whose ``predict()`` returns one ``_Results`` with numpy
+    ``xyxy/conf/cls`` arrays (or ``boxes=None``) and a ``names`` dict —
+    exactly the shape ``_UltralyticsPredictor`` consumes.
     """
     pkg = root / "ultralytics"
     pkg.mkdir(parents=True)
@@ -1187,19 +1208,21 @@ def _write_fake_ultralytics(root, pinned):
         "        self.conf = np.array(conf, dtype=float)\n"
         "        self.cls = np.array(cls, dtype=int)\n"
         "class _Results:\n"
-        "    def __init__(self, xyxy, conf, cls):\n"
-        "        self.boxes = _Boxes(xyxy, conf, cls)\n"
+        "    def __init__(self, boxes):\n"
+        "        self.boxes = boxes\n"
         "        self.names = {0: 'plant'}\n"
         "class YOLO:\n"
         "    def __init__(self, weights):\n"
         "        self.weights = weights\n"
         "    def predict(self, image):\n"
-        "        dets = PINNED.get(int(image[0, 0, 0]), [])\n"
-        "        return [_Results(\n"
+        "        dets = PINNED.get(int(image[0, 0, 0]))\n"
+        "        if dets is None:\n"
+        "            return [_Results(None)]  # zero detections -> boxes=None\n"
+        "        return [_Results(_Boxes(\n"
         "            [d['xyxy'] for d in dets],\n"
         "            [d['conf'] for d in dets],\n"
         "            [d['cls'] for d in dets],\n"
-        "        )]\n",
+        "        ))]\n",
         encoding="utf-8",
     )
     return root
@@ -1332,6 +1355,62 @@ class TestSubprocessCli:
         assert "summary flight=F2 photos=1 plants=1" in proc.stdout
         assert (
             "verbose flight=F2 photo=DJI_0002.JPG tiles=2 boxes=2 kept=1"
+            in proc.stdout
+        )
+
+    def test_zero_detection_photo_yields_zero_row_and_does_not_abort(
+        self, tmp_path, make_tile_input
+    ):
+        # R4-001: a photo with no detections (ultralytics boxes=None) yields
+        # a 0-count CSV row and MUST NOT abort the batch — the next photo is
+        # still counted.
+        make_tile_input(
+            [
+                {
+                    "flight": "F9",
+                    "photo": "DJI_0009.JPG",
+                    "photo_w": 640,
+                    "photo_h": 640,
+                    "tiles": [("e1.png", 0, 0, 640, 640, 91)],  # no detections
+                },
+                {
+                    "flight": "F9",
+                    "photo": "DJI_0010.JPG",
+                    "photo_w": 640,
+                    "photo_h": 640,
+                    "tiles": [("n1.png", 0, 0, 640, 640, 92)],  # one plant
+                },
+            ]
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        stub = _write_fake_ultralytics(
+            tmp_path / "stub",
+            {
+                91: None,  # boxes=None for this photo
+                92: [{"xyxy": [10.0, 10.0, 110.0, 110.0], "conf": 0.9, "cls": 0}],
+            },
+        )
+        out = tmp_path / "counts.csv"
+        proc = _run_infer(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+                "--verbose",
+            ],
+            env=_stub_env(stub),
+        )
+        assert proc.returncode == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+            "F9,DJI_0009.JPG,0,0,0,\n"
+            "F9,DJI_0010.JPG,1,1,0,n1.png\n"
+        )
+        assert (
+            "verbose flight=F9 photo=DJI_0009.JPG tiles=1 boxes=0 kept=0"
             in proc.stdout
         )
 

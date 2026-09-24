@@ -328,6 +328,12 @@ class _UltralyticsPredictor:
         results = self._model.predict(image)
         try:
             boxes = results[0].boxes
+            if boxes is None:
+                # Zero detections (ultralytics 8.4.x sets boxes=None for an
+                # empty photo): empty photos are the norm in plant counting,
+                # so yield no detections instead of aborting the batch
+                # (R4-001 — overrides the previous fail-fast on no boxes).
+                return []
             xyxy_rows = boxes.xyxy.tolist()
             confs = boxes.conf.tolist()
             clss = boxes.cls.tolist()
