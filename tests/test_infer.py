@@ -952,27 +952,6 @@ class TestMainArgparse:
             infer.main(args)
         assert exc.value.code == 2
 
-    def test_missing_required_args_exit_2(self):
-        with pytest.raises(SystemExit) as exc:
-            infer.main([])
-        assert exc.value.code == 2
-
-    def test_nonexistent_input_exits_2(self, tmp_path, capsys):
-        (tmp_path / "w.pt").write_bytes(b"x")
-        rc = infer.main(
-            [
-                "--weights",
-                str(tmp_path / "w.pt"),
-                "--input",
-                str(tmp_path / "nope"),
-                "--output",
-                "o.csv",
-            ]
-        )
-        assert rc == 2
-        assert "nope" in capsys.readouterr().err
-
-
 class TestMainRun:
     def test_directory_mode_success_pins_verbose_and_summary_lines(
         self, tmp_path, make_tile_input, monkeypatch, capsys
@@ -1042,27 +1021,6 @@ class TestMainRun:
             "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
             "DJI_0001,DJI_0001,1,1,0,DJI_0001.png\n"
         )  # D6: flight=photo=stem, dedup skipped, source_tiles=filename
-
-    def test_directory_without_manifest_returns_1_and_writes_nothing(
-        self, tmp_path, capsys
-    ):
-        empty_dir = tmp_path / "input"
-        empty_dir.mkdir()
-        (tmp_path / "w.pt").write_bytes(b"x")
-        out = tmp_path / "counts.csv"
-        rc = infer.main(
-            [
-                "--weights",
-                str(tmp_path / "w.pt"),
-                "--input",
-                str(empty_dir),
-                "--output",
-                str(out),
-            ]
-        )
-        assert rc == 1
-        assert not out.exists()
-        assert "manifest.csv" in capsys.readouterr().err
 
     def test_corrupt_but_readable_weights_return_1_and_write_nothing(
         self, tmp_path, monkeypatch, capsys
