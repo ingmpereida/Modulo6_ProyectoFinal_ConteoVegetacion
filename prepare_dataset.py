@@ -142,6 +142,104 @@ def copy_label(src_txt: Path, dst_dir: Path) -> Path | None:
     return dst
 
 
+def read_manifest(manifest_path: Path) -> list[dict]:
+    """Parse manifest.csv into row dicts, validating its shape (FR-1).
+
+    The file must exist, contain at least one data row, and provide the
+    vuelo and tile columns. Raises DatasetError on any violation.
+    """
+    if not manifest_path.is_file():
+        raise DatasetError(f"manifest not found: {manifest_path}")
+    try:
+        with manifest_path.open(newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    except OSError as exc:
+        raise DatasetError(f"cannot read manifest {manifest_path}: {exc}") from exc
+
+    if not rows:
+        raise DatasetError(f"manifest has no data rows: {manifest_path}")
+    for column in ("vuelo", "tile"):
+        if column not in rows[0]:
+            raise DatasetError(
+                f"manifest is missing required column {column!r}: {manifest_path}"
+            )
+    bad_rows = [
+        lineno
+        for lineno, row in enumerate(rows, start=2)
+        if not row.get("vuelo") or not row.get("tile")
+    ]
+    if bad_rows:
+        raise DatasetError(
+            f"manifest has empty vuelo/tile values at row(s): {bad_rows}"
+        )
+    return rows
+
+
+def write_layout(
+    manifest_path: Path,
+    labels_root: Path,
+    output_dir: Path,
+    valid_ratio: float = DEFAULT_VALID_RATIO,
+    seed: int = DEFAULT_SEED,
+    names: list[str] | None = None,
+) -> dict:
+    """Write a complete YOLO dataset layout from a manifest + tiles root.
+
+    FR-4: ALL inputs (manifest shape, image existence, sidecar content) are
+    validated BEFORE --output is created; on any error nothing is written.
+    Reruns overwrite deterministically (NFR-1): same inputs + seed produce a
+    byte-identical tree.
+    """
+    if not 0.0 < valid_ratio < 1.0:
+        raise DatasetError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+
+    rows = read_manifest(manifest_path)
+    groups = group_flights(rows)
+
+    # Phase 1 — validate everything before touching the output dir.
+    for flight in sorted(groups):
+        flight_dir = labels_root / flight
+        for row in groups[flight]:
+            image = flight_dir / row["tile"]
+            if not image.is_file():
+                raise DatasetError(f"image not found: {image}")
+            sidecar = image.with_suffix(".txt")
+            if sidecar.exists():
+                validate_label_file(sidecar)
+
+    # Phase 2 — write. mkdir(..., exist_ok=True) + plain copies make reruns
+    # overwrite the previous tree instead of failing (FR-4 idempotency).
+    for split in ("train", "valid"):
+        (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
+        (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+    summary = {
+        "flights": len(groups),
+        "train_images": 0,
+        "valid_images": 0,
+        "background_images": 0,
+    }
+    for flight in sorted(groups):
+        flight_dir = labels_root / flight
+        tiles = [row["tile"] for row in groups[flight]]
+        train_tiles, valid_tiles = split_tiles(tiles, valid_ratio=valid_ratio, seed=seed)
+        for split, split_tiles_ in (("train", train_tiles), ("valid", valid_tiles)):
+            images_dir = output_dir / "images" / split
+            labels_dir = output_dir / "labels" / split
+            for tile in split_tiles_:
+                shutil.copyfile(flight_dir / tile, images_dir / tile)
+                summary["train_images" if split == "train" else "valid_images"] += 1
+                copied = copy_label((flight_dir / tile).with_suffix(".txt"), labels_dir)
+                if copied is None:
+                    summary["background_images"] += 1
+
+    (output_dir / "data.yaml").write_text(
+        yaml.safe_dump(build_yaml(output_dir, names), sort_keys=False),
+        encoding="utf-8",
+    )
+    return summary
+
+
 def main(argv: list[str] | None = None) -> int:
     raise NotImplementedError  # placeholder; CLI lands with tasks 2.11-2.12
 
