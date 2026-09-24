@@ -89,6 +89,59 @@ def build_yaml(dataset_path: Path, names: list[str] | None = None) -> dict:
     }
 
 
+def validate_label_file(sidecar: Path) -> None:
+    """Validate a YOLO sidecar before it is copied (C-3).
+
+    Contract: one box per line as `class x y w h` (normalized floats), so
+    every non-empty line must have exactly 5 whitespace-separated fields, a
+    non-negative integer class id, and 4 float coordinates. Raises
+    LabelFormatError on malformed content — fail fast, never ship a silently
+    corrupted dataset.
+    """
+    try:
+        lines = sidecar.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise LabelFormatError(f"cannot read label file {sidecar}: {exc}") from exc
+
+    for lineno, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != YOLO_LINE_FIELDS:
+            raise LabelFormatError(
+                f"malformed label {sidecar}:{lineno}: expected {YOLO_LINE_FIELDS} "
+                f"fields (class x y w h), got {len(fields)}"
+            )
+        if not fields[0].isdigit():
+            raise LabelFormatError(
+                f"malformed label {sidecar}:{lineno}: class id {fields[0]!r} "
+                f"is not a non-negative integer"
+            )
+        for field in fields[1:]:
+            try:
+                float(field)
+            except ValueError:
+                raise LabelFormatError(
+                    f"malformed label {sidecar}:{lineno}: {field!r} is not a float"
+                ) from None
+
+
+def copy_label(src_txt: Path, dst_dir: Path) -> Path | None:
+    """Copy a YOLO sidecar into dst_dir (FR-3).
+
+    This is the single seam that reads label bytes (design D-3). Returns the
+    destination path, or None when src_txt is missing — the tile is then a
+    background sample and only its image is written. Malformed sidecars raise
+    LabelFormatError so a corrupt dataset never ships silently.
+    """
+    if not src_txt.exists():
+        return None
+    validate_label_file(src_txt)
+    dst = dst_dir / src_txt.name
+    shutil.copyfile(src_txt, dst)
+    return dst
+
+
 def main(argv: list[str] | None = None) -> int:
     raise NotImplementedError  # placeholder; CLI lands with tasks 2.11-2.12
 
