@@ -176,3 +176,75 @@ def load_image(path: Path | str) -> np.ndarray:
             return np.asarray(img.convert("RGB"), dtype=np.uint8)
     except (ValueError, OSError) as exc:
         raise ValueError(f"cannot decode image: {img_path}") from exc
+
+
+def read_tiles(manifest_path: Path, tiles_root: Path) -> list[TileSpec]:
+    """Parse a tile_pipeline manifest.csv into TileSpecs, in manifest row order.
+
+    Column contract (tile_pipeline.py): vuelo, imagen_origen, tile,
+    x_offset, y_offset, tile_w, tile_h, imagen_ancho, imagen_alto. Each tile
+    resolves to ``tiles_root / vuelo / tile``; a manifest that references a
+    missing tile image raises FileNotFoundError (the CLI maps it to exit 1).
+    """
+    tiles: list[TileSpec] = []
+    with Path(manifest_path).open("r", newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            tile_path = tiles_root / row["vuelo"] / row["tile"]
+            if not tile_path.is_file():
+                raise FileNotFoundError(
+                    f"manifest references missing tile image: {tile_path}"
+                )
+            tiles.append(
+                TileSpec(
+                    path=tile_path,
+                    flight=row["vuelo"],
+                    photo=row["imagen_origen"],
+                    x_offset=int(row["x_offset"]),
+                    y_offset=int(row["y_offset"]),
+                    tile_w=int(row["tile_w"]),
+                    tile_h=int(row["tile_h"]),
+                    photo_w=int(row["imagen_ancho"]),
+                    photo_h=int(row["imagen_alto"]),
+                )
+            )
+    return tiles
+
+
+def count_photo(
+    tiles: list[TileSpec], load_image, predict, conf: float, iou: float
+) -> PhotoResult:
+    """Count the plants in one photo from its tiles, in manifest row order.
+
+    Per tile: load -> predict -> filter (class + conf) -> project to photo
+    space -> clip to photo bounds (FR-3, D5); ``box_count`` accumulates the
+    filter-passing detections. Per photo: global IoU NMS dedup (FR-4, D2)
+    yields ``global_count``; ``dedup_removed = box_count - global_count``
+    (FR-4) and ``source_tiles`` = sorted names of the tiles that contributed
+    any box to the counting pool — both tiles of a merged duplicate are
+    listed (FR-4 scenario). A photo with a single tile skips dedup: with no
+    second offset there is nothing to dedup against (D6 / FR-2 scenario).
+    """
+    if not tiles:
+        raise ValueError("count_photo requires at least one tile")
+    photo_w, photo_h = tiles[0].photo_w, tiles[0].photo_h
+    pool: list[tuple[str, Box]] = []
+    box_count = 0
+    for tile in tiles:  # manifest row order, never re-sorted (NFR-3)
+        for box in filter_boxes(predict(load_image(tile.path)), conf):
+            box_count += 1
+            clipped = clip_box(
+                project_box(box, tile.x_offset, tile.y_offset), photo_w, photo_h
+            )
+            if clipped is not None:
+                pool.append((tile.path.name, clipped))
+    source_tiles = tuple(sorted({name for name, _ in pool}))
+    if len(tiles) <= 1:
+        global_count = len(pool)
+    else:
+        global_count = len(nms_dedup([box for _, box in pool], iou))
+    return PhotoResult(
+        global_count=global_count,
+        box_count=box_count,
+        dedup_removed=box_count - global_count,
+        source_tiles=source_tiles,
+    )
