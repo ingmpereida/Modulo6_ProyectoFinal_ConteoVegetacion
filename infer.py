@@ -16,9 +16,11 @@ pure and deterministic (NFR-2) and consumes the predictor duck-type
 or test this module.
 """
 
+import argparse
 import csv
 import io
 import itertools
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -365,3 +367,179 @@ def load_model(weights: str) -> Predictor:
     from ultralytics import YOLO
 
     return _UltralyticsPredictor(YOLO(weights))
+
+
+def _existing_file(value: str) -> Path:
+    """argparse type: the path must be an existing regular file (finding 4).
+
+    ``Path.is_file()`` rejects both missing paths and directories, which is
+    the exact FR-1 "missing/unreadable --weights -> exit 2" gate. ``os.access``
+    is deliberately avoided (unreliable ACLs on win32).
+    """
+    path = Path(value)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"weights file not found or not readable: {value}")
+    return path
+
+
+def _bounded_float(flag: str) -> Callable[[str], float]:
+    """argparse type factory for an open (0, 1) interval (D4)."""
+
+    def _parse(value: str) -> float:
+        try:
+            number = float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"--{flag} must be strictly between 0 and 1") from None
+        if not 0.0 < number < 1.0:
+            raise argparse.ArgumentTypeError(
+                f"--{flag} must be strictly between 0 and 1, got {value}"
+            )
+        return number
+
+    return _parse
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="infer.py",
+        description=(
+            "Count plants in drone photos from YOLO detections over "
+            "tile_pipeline.py tiles (FR-1)."
+        ),
+    )
+    parser.add_argument(
+        "--weights",
+        required=True,
+        type=_existing_file,
+        metavar="PATH",
+        help="trained YOLO weights (.pt); must exist and be readable (else exit 2)",
+    )
+    parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="single photo (JPEG/PNG/TIF) OR directory containing manifest.csv + tiles/",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        metavar="CSV",
+        help="CSV path; written only after ALL photos succeed (NFR-6)",
+    )
+    parser.add_argument(
+        "--conf",
+        default=0.25,
+        type=_bounded_float("conf"),
+        metavar="F",
+        help="minimum detection confidence, strictly between 0 and 1 (default 0.25)",
+    )
+    parser.add_argument(
+        "--iou",
+        default=0.5,
+        type=_bounded_float("iou"),
+        metavar="F",
+        help="global NMS IoU threshold, strictly between 0 and 1 (default 0.5)",
+    )
+    parser.add_argument(
+        "--summary", action="store_true", help="print per-flight totals to stdout"
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="print per-photo progress lines"
+    )
+    return parser
+
+
+def _single_photo_tiles(path: Path) -> list[TileSpec]:
+    """Turn one photo into a single full-size tile spec (D6 / FR-2).
+
+    flight = photo = the file stem, offsets (0, 0), dims taken from the
+    decoded image. With a single tile the pipeline skips dedup (D6) and the
+    CSV row gets ``source_tiles`` = the photo filename.
+    """
+    image = load_image(path)
+    h, w = image.shape[:2]
+    return [
+        TileSpec(
+            path=path,
+            flight=path.stem,
+            photo=path.stem,
+            x_offset=0,
+            y_offset=0,
+            tile_w=w,
+            tile_h=h,
+            photo_w=w,
+            photo_h=h,
+        )
+    ]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the counting CLI and return the process exit code (FR-1).
+
+    0 = success (CSV written); 1 = data/processing error after argument
+    validation (nothing written, NFR-6/D7); 2 = invalid usage — argparse
+    exits with SystemExit(2) before any work: missing/unreadable weights,
+    out-of-range --conf/--iou, missing required args, nonexistent --input.
+    """
+    args = _build_parser().parse_args(argv)
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"error: input path does not exist: {input_path}", file=sys.stderr)
+        return 2
+
+    try:
+        if input_path.is_dir():
+            manifest = input_path / "manifest.csv"
+            if not manifest.is_file():
+                print(
+                    f"error: missing manifest.csv in input directory: {input_path}",
+                    file=sys.stderr,
+                )
+                return 1
+            tiles = read_tiles(manifest, input_path / "tiles")
+        else:  # single photo: no manifest, no dedup (D6)
+            tiles = _single_photo_tiles(input_path)
+
+        model = load_model(str(args.weights))
+
+        # (flight, photo) groups in first-seen manifest order (NFR-3).
+        groups: dict[tuple[str, str], list[TileSpec]] = {}
+        for tile in tiles:
+            groups.setdefault((tile.flight, tile.photo), []).append(tile)
+
+        rows: list[dict] = []
+        for (flight, photo), photo_tiles in groups.items():
+            result = count_photo(
+                photo_tiles, load_image, model.predict, args.conf, args.iou
+            )
+            if args.verbose:
+                print(
+                    f"verbose flight={flight} photo={photo} tiles={len(photo_tiles)} "
+                    f"boxes={result.box_count} kept={result.global_count}"
+                )
+            rows.append(
+                {
+                    "flight": flight,
+                    "photo": photo,
+                    "global_count": result.global_count,
+                    "box_count": result.box_count,
+                    "dedup_removed": result.dedup_removed,
+                    "source_tiles": result.source_tiles,
+                }
+            )
+
+        # Validate-then-write (D7): render once, write once, bytes only.
+        csv_text = render_csv(rows)
+        Path(args.output).write_bytes(csv_text.encode("utf-8"))
+        if args.summary:
+            for line in render_summaries(rows):
+                print(line)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

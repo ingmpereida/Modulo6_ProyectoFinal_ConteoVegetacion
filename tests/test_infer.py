@@ -266,11 +266,14 @@ class TestPr1Gate:
         assert len(lazy_imports) == 1
         assert lazy_imports[0].startswith("    ")  # indented: inside load_model()
 
-    def test_source_is_importable_library_without_cli(self):
+    def test_source_ships_cli_entrypoint_with_main(self):
+        # PR3 moved the "no CLI" PR1 boundary: infer.py is now a runnable
+        # module — argument parser, main(), and a sys.exit-wired __main__.
         src = Path(infer.__file__).read_text(encoding="utf-8")
-        assert "argparse" not in src
-        assert "__main__" not in src
-        assert "sys.exit" not in src
+        assert "argparse" in src
+        assert "def main(argv" in src
+        assert "if __name__ == \"__main__\":" in src
+        assert "raise SystemExit(main())" in src
 
 
 # ---------------------------------------------------------------------------
@@ -890,3 +893,240 @@ class TestLoadModel:
         # NFR-1: importing infer (already imported at session start) must not
         # have pulled the runtime in — the seam is lazy by construction.
         assert "ultralytics" not in sys.modules
+
+
+# ---------------------------------------------------------------------------
+# PR3 3.2-3.5: main() CLI — argparse contract, exit codes, input modes,
+# validate-then-write (NFR-6/D7), pinned verbose + summary lines.
+# ---------------------------------------------------------------------------
+
+
+class TestMainArgparse:
+    def test_help_lists_all_arguments_and_exits_zero(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            infer.main(["--help"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        for flag in (
+            "--weights",
+            "--input",
+            "--output",
+            "--conf",
+            "--iou",
+            "--summary",
+            "--verbose",
+        ):
+            assert flag in out
+
+    def test_bad_weights_exit_2_and_stderr_names_the_path(self, tmp_path, capsys):
+        # non-existent path AND directory path both fail the is_file() gate
+        cases = [str(tmp_path / "missing.pt"), str(tmp_path)]
+        for weights in cases:
+            with pytest.raises(SystemExit) as exc:
+                infer.main(["--weights", weights, "--input", "x", "--output", "o.csv"])
+            assert exc.value.code == 2
+            assert weights in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "extra_args",
+        [
+            ["--conf", "1.5"],
+            ["--conf", "0"],
+            ["--conf", "abc"],
+            ["--iou", "0"],
+            ["--iou", "1"],
+            ["--iou", "-0.1"],
+        ],
+    )
+    def test_out_of_range_conf_or_iou_exits_2(self, tmp_path, extra_args):
+        (tmp_path / "w.pt").write_bytes(b"x")
+        args = [
+            "--weights",
+            str(tmp_path / "w.pt"),
+            "--input",
+            "x",
+            "--output",
+            "o.csv",
+        ] + extra_args
+        with pytest.raises(SystemExit) as exc:
+            infer.main(args)
+        assert exc.value.code == 2
+
+    def test_missing_required_args_exit_2(self):
+        with pytest.raises(SystemExit) as exc:
+            infer.main([])
+        assert exc.value.code == 2
+
+    def test_nonexistent_input_exits_2(self, tmp_path, capsys):
+        (tmp_path / "w.pt").write_bytes(b"x")
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path / "nope"),
+                "--output",
+                "o.csv",
+            ]
+        )
+        assert rc == 2
+        assert "nope" in capsys.readouterr().err
+
+
+class TestMainRun:
+    def test_directory_mode_success_pins_verbose_and_summary_lines(
+        self, tmp_path, make_tile_input, monkeypatch, capsys
+    ):
+        # make_tile_input writes manifest.csv + tiles/ under tmp_path, so
+        # tmp_path is a valid directory-mode --input.
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F2",
+                    "photo": "DJI_0002.JPG",
+                    "photo_w": 960,
+                    "photo_h": 640,
+                    "tiles": [("t1.png", 0, 0, 640, 640, 11), ("t2.png", 320, 0, 640, 640, 12)],
+                }
+            ]
+        )
+        (tmp_path / "w.pt").write_bytes(b"x")
+        model = FakeModel(
+            {
+                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
+                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
+            }
+        )
+        monkeypatch.setattr(infer, "load_model", lambda weights: model)
+        out = tmp_path / "counts.csv"
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+                "--summary",
+                "--verbose",
+            ]
+        )
+        assert rc == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+            "F2,DJI_0002.JPG,1,2,1,t1.png;t2.png\n"
+        )
+        captured = capsys.readouterr()
+        assert "verbose flight=F2 photo=DJI_0002.JPG tiles=2 boxes=2 kept=1" in captured.out
+        assert "summary flight=F2 photos=1 plants=1" in captured.out
+
+    def test_single_photo_mode_row_contract(self, tmp_path, monkeypatch):
+        photo = tmp_path / "DJI_0001.png"
+        photo.write_bytes(_image_bytes("PNG", "RGB", (6, 4), (7, 8, 9)))
+        (tmp_path / "w.pt").write_bytes(b"x")
+        model = FakeModel({7: [{"xyxy": [1.0, 1.0, 4.0, 3.0], "conf": 0.9, "cls": 0}]})
+        monkeypatch.setattr(infer, "load_model", lambda weights: model)
+        out = tmp_path / "counts.csv"
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(photo),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 0
+        assert out.read_text(encoding="utf-8") == (
+            "flight,photo,global_count,box_count,dedup_removed,source_tiles\n"
+            "DJI_0001,DJI_0001,1,1,0,DJI_0001.png\n"
+        )  # D6: flight=photo=stem, dedup skipped, source_tiles=filename
+
+    def test_directory_without_manifest_returns_1_and_writes_nothing(
+        self, tmp_path, capsys
+    ):
+        empty_dir = tmp_path / "input"
+        empty_dir.mkdir()
+        (tmp_path / "w.pt").write_bytes(b"x")
+        out = tmp_path / "counts.csv"
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(empty_dir),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 1
+        assert not out.exists()
+        assert "manifest.csv" in capsys.readouterr().err
+
+    def test_corrupt_but_readable_weights_return_1_and_write_nothing(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        def _boom(weights):
+            raise RuntimeError(f"failed to load weights: {weights}")
+
+        monkeypatch.setattr(infer, "load_model", _boom)
+        photo = tmp_path / "p.png"
+        photo.write_bytes(_image_bytes("PNG", "RGB", (2, 2), (5, 0, 0)))
+        (tmp_path / "w.pt").write_bytes(b"junk")  # exists and is readable
+        out = tmp_path / "counts.csv"
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(photo),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 1
+        assert not out.exists()
+        assert "failed to load weights" in capsys.readouterr().err
+
+    def test_mid_run_failure_leaves_no_new_csv_and_keeps_existing_output(
+        self, tmp_path, make_tile_input, monkeypatch
+    ):
+        # NFR-6/D7: photo a succeeds, photo b fails to decode mid-run -> exit 1,
+        # nothing written, pre-existing output byte-untouched.
+        manifest, root = make_tile_input(
+            [
+                {
+                    "flight": "F1",
+                    "photo": "a.JPG",
+                    "photo_w": 640,
+                    "photo_h": 640,
+                    "tiles": [("a1.png", 0, 0, 640, 640, 1)],
+                },
+                {
+                    "flight": "F1",
+                    "photo": "b.JPG",
+                    "photo_w": 640,
+                    "photo_h": 640,
+                    "tiles": [("b1.png", 0, 0, 640, 640, 2)],
+                },
+            ]
+        )
+        (root / "F1" / "b1.png").write_bytes(b"definitely not an image")
+        (tmp_path / "w.pt").write_bytes(b"x")
+        model = FakeModel({1: [{"xyxy": [0.0, 0.0, 10.0, 10.0], "conf": 0.9, "cls": 0}]})
+        monkeypatch.setattr(infer, "load_model", lambda weights: model)
+        out = tmp_path / "counts.csv"
+        out.write_text("sentinel\n", encoding="utf-8")
+        rc = infer.main(
+            [
+                "--weights",
+                str(tmp_path / "w.pt"),
+                "--input",
+                str(tmp_path),
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 1
+        assert out.read_text(encoding="utf-8") == "sentinel\n"
