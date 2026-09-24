@@ -5,16 +5,21 @@ PR1 shipped the importable geometry core: the pixel-space xyxy Box contract
 plus the filter/project/clip/IoU/NMS helpers used by the counting pipeline.
 PR2 layers the counting pipeline on top: manifest-driven tile specs, PIL
 image loading (PNG/JPEG/TIF -> RGB numpy arrays), the per-photo counting
-orchestration, and deterministic CSV/summary rendering. Everything stays
+orchestration, and deterministic CSV/summary rendering. PR3 closes the
+module: ``load_model`` is the single seam to the ultralytics detector
+(lazy-imported inside the function, so module import and ``--help`` never
+pull the heavy runtime in — NFR-1), and ``main()`` wires the command-line
+contract (FR-1/FR-2: argument parser, exit codes, input modes,
+validate-then-write, and the pinned summary/verbose lines). Everything stays
 pure and deterministic (NFR-2) and consumes the predictor duck-type
-`predict(image) -> [Box]`, so the heavy detector runtime is never needed to
-import or test this module (NFR-1). The detector seam and the command-line
-entry point land in PR3.
+`predict(image) -> [Box]`, so the detector runtime is never needed to import
+or test this module.
 """
 
 import csv
 import io
 import itertools
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +31,7 @@ __all__ = [
     "Box",
     "TileSpec",
     "PhotoResult",
+    "Predictor",
     "filter_boxes",
     "project_box",
     "clip_box",
@@ -36,6 +42,8 @@ __all__ = [
     "count_photo",
     "render_csv",
     "render_summaries",
+    "load_model",
+    "main",
 ]
 
 
@@ -291,3 +299,69 @@ def render_summaries(rows: list[dict]) -> list[str]:
             f"plants={sum(r['global_count'] for r in group_rows)}"
         )
     return summaries
+
+
+# ---------------------------------------------------------------------------
+# PR3: predictor seam + command-line entry point
+# ---------------------------------------------------------------------------
+
+
+Predictor = Callable[[np.ndarray], list[dict]]  # .predict(img) -> [{xyxy, conf, cls}]
+
+
+class _UltralyticsPredictor:
+    """Adapt an ultralytics YOLO to the Predictor duck-type (pixel-xyxy dicts).
+
+    Maps ``results[0].boxes.xyxy/conf/cls`` (tensors) to the pixel-space dict
+    contract ``{xyxy: [4 floats], conf: float, cls: int}`` (design D1), so the
+    rest of the pipeline sees the same shape FakeModel produces. Fails fast
+    (RuntimeError) when the result shape drifts from what the pipeline
+    expects, so a silent counting corruption can never pass unnoticed.
+    """
+
+    def __init__(self, model):
+        self._model = model
+
+    def predict(self, image: np.ndarray) -> list[dict]:
+        results = self._model.predict(image)
+        try:
+            boxes = results[0].boxes
+            xyxy_rows = boxes.xyxy.tolist()
+            confs = boxes.conf.tolist()
+            clss = boxes.cls.tolist()
+        except (AttributeError, IndexError, TypeError) as exc:
+            raise RuntimeError(
+                "unexpected ultralytics result shape: expected results[0].boxes "
+                "with xyxy/conf/cls tensors (pixel-xyxy contract, design D1)"
+            ) from exc
+        out: list[dict] = []
+        for i, row in enumerate(xyxy_rows):
+            out.append(
+                {
+                    "xyxy": [float(v) for v in row],
+                    "conf": float(_scalar(confs[i])),
+                    "cls": int(_scalar(clss[i])),
+                }
+            )
+        return out
+
+
+def _scalar(value):
+    """Unwrap a one-level-nested scalar (ultralytics emits (N,1) tensors sometimes)."""
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return value[0]
+    return value
+
+
+def load_model(weights: str) -> Predictor:
+    """Build the predictor for ``weights`` — the module's ONLY ultralytics seam.
+
+    The YOLO runtime is imported lazily INSIDE this function, so importing
+    infer or running ``--help`` never pulls ultralytics in (NFR-1). The CLI
+    rejects a missing/unreadable path earlier (FR-1, exit 2); here, any load
+    failure — e.g. corrupt-but-readable weights — raises and the CLI maps it
+    to exit 1 (D8).
+    """
+    from ultralytics import YOLO
+
+    return _UltralyticsPredictor(YOLO(weights))

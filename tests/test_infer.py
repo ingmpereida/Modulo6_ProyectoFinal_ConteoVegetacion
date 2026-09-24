@@ -253,9 +253,18 @@ class TestNmsDedup:
 
 
 class TestPr1Gate:
-    def test_source_never_imports_ultralytics(self):
+    def test_ultralytics_is_seam_only_and_never_imported_at_module_level(self):
+        # PR3 moved the PR1 boundary: the detector runtime is now NAMED in
+        # infer.py, but only inside load_model (lazy import, NFR-1) — a
+        # module-level import would break --help and the unit suite.
         src = Path(infer.__file__).read_text(encoding="utf-8")
-        assert "ultralytics" not in src
+        lazy_imports = [
+            line
+            for line in src.splitlines()
+            if line.lstrip().startswith(("import ultralytics", "from ultralytics"))
+        ]
+        assert len(lazy_imports) == 1
+        assert lazy_imports[0].startswith("    ")  # indented: inside load_model()
 
     def test_source_is_importable_library_without_cli(self):
         src = Path(infer.__file__).read_text(encoding="utf-8")
@@ -749,10 +758,135 @@ class TestPr2Gate:
         }
         assert infer.render_csv([row]) == infer.render_csv([row])
 
-    def test_no_ultralytics_imports_anywhere_in_sources(self):
-        # infer.py never names the heavy runtime (PR1 gate, strict); conftest
-        # allows pre-existing docstring prose but never imports it (NFR-1).
-        assert "ultralytics" not in Path(infer.__file__).read_text(encoding="utf-8")
+    def test_ultralytics_imports_only_inside_load_model(self):
+        # infer.py: the runtime is NAMED (PR3 seam) but can only be imported
+        # lazily inside load_model — never at module level (NFR-1); conftest
+        # keeps the same strict rule as before (no imports of ultralytics).
+        src = Path(infer.__file__).read_text(encoding="utf-8")
+        for line in src.splitlines():
+            if line.lstrip().startswith(("import ultralytics", "from ultralytics")):
+                assert line.startswith("    ")  # inside a function, lazy
         conftest_src = Path(__file__).parent.joinpath("conftest.py").read_text(encoding="utf-8")
         for line in conftest_src.splitlines():
             assert not line.lstrip().startswith(("import ultralytics", "from ultralytics"))
+
+
+# ---------------------------------------------------------------------------
+# PR3 3.1: load_model — the ONLY ultralytics seam (lazy import inside) + the
+# _UltralyticsPredictor adapter mapping results[0].boxes to pixel-xyxy dicts.
+# ---------------------------------------------------------------------------
+
+
+class _TensorShim:
+    """Minimal fake for an ultralytics tensor: only what the adapter uses."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def tolist(self):
+        return self._data
+
+
+class _FakeBoxes:
+    """results[0].boxes stand-in: xyxy/conf/cls as tensor shims."""
+
+    def __init__(self, raw):
+        # raw: list of (xyxy, conf, cls) tuples
+        self.xyxy = _TensorShim([b[0] for b in raw])
+        self.conf = _TensorShim([b[1] for b in raw])
+        self.cls = _TensorShim([b[2] for b in raw])
+
+
+class _FakeResults:
+    def __init__(self, raw):
+        self.boxes = _FakeBoxes(raw)
+
+
+class _FakePredictorModel:
+    """Model whose .predict returns canned ultralytics-style results."""
+
+    def __init__(self, results):
+        self._results = results
+
+    def predict(self, image):
+        return self._results
+
+
+class TestUltralyticsAdapter:
+    def test_maps_results_boxes_to_pixel_xyxy_dicts(self):
+        raw = [((10.0, 20.0, 30.0, 40.0), 0.9, 0)]
+        predictor = infer._UltralyticsPredictor(
+            _FakePredictorModel([_FakeResults(raw)])
+        )
+        out = predictor.predict(np.zeros((4, 4, 3), dtype=np.uint8))
+        assert out == [{"xyxy": [10.0, 20.0, 30.0, 40.0], "conf": 0.9, "cls": 0}]
+
+    def test_maps_multiple_boxes_deterministically(self):
+        raw = [
+            ((0.0, 0.0, 10.0, 10.0), 0.9, 0),
+            ((100.0, 100.0, 200.0, 200.0), 0.4, 0),
+        ]
+        predictor = infer._UltralyticsPredictor(
+            _FakePredictorModel([_FakeResults(raw)])
+        )
+        out = predictor.predict(np.zeros((4, 4, 3), dtype=np.uint8))
+        assert out == [
+            {"xyxy": [0.0, 0.0, 10.0, 10.0], "conf": 0.9, "cls": 0},
+            {"xyxy": [100.0, 100.0, 200.0, 200.0], "conf": 0.4, "cls": 0},
+        ]
+
+    def test_zero_boxes_yield_empty_list(self):
+        predictor = infer._UltralyticsPredictor(
+            _FakePredictorModel([_FakeResults([])])
+        )
+        assert predictor.predict(np.zeros((4, 4, 3), dtype=np.uint8)) == []
+
+    def test_tolerates_singleton_nested_conf_and_cls_tensors(self):
+        # ultralytics occasionally emits (N,1) tensors for conf/cls; the
+        # adapter must unwrap one nesting level instead of producing [[0.9]].
+        raw = [((10.0, 20.0, 30.0, 40.0), [0.9], [0])]
+        predictor = infer._UltralyticsPredictor(
+            _FakePredictorModel([_FakeResults(raw)])
+        )
+        out = predictor.predict(np.zeros((4, 4, 3), dtype=np.uint8))
+        assert out[0]["conf"] == 0.9
+        assert out[0]["cls"] == 0
+
+    def test_fails_fast_when_results_have_no_boxes(self):
+        class _NoBoxes:
+            pass
+
+        predictor = infer._UltralyticsPredictor(_FakePredictorModel([_NoBoxes()]))
+        with pytest.raises(RuntimeError):
+            predictor.predict(np.zeros((4, 4, 3), dtype=np.uint8))
+
+    def test_fails_fast_when_results_are_empty(self):
+        predictor = infer._UltralyticsPredictor(_FakePredictorModel([]))
+        with pytest.raises(RuntimeError):
+            predictor.predict(np.zeros((4, 4, 3), dtype=np.uint8))
+
+
+class TestLoadModel:
+    def test_imports_ultralytics_lazily_and_returns_a_predictor(self, monkeypatch):
+        import types
+
+        class _FakeYOLO:
+            def __init__(self, weights):
+                self.weights = weights
+
+            def predict(self, image):
+                # one Results per image, even with zero boxes (ultralytics shape)
+                return [_FakeResults([])]
+
+        fake_module = types.ModuleType("ultralytics")
+        fake_module.YOLO = _FakeYOLO
+        monkeypatch.setitem(sys.modules, "ultralytics", fake_module)
+
+        predictor = infer.load_model("runs/train/exp/weights/best.pt")
+        assert isinstance(predictor, infer._UltralyticsPredictor)
+        assert predictor.predict(np.zeros((2, 2, 3), dtype=np.uint8)) == []
+
+    def test_module_import_never_preloads_ultralytics(self):
+        # NFR-1: importing infer (already imported at session start) must not
+        # have pulled the runtime in — the seam is lazy by construction.
+        assert "ultralytics" not in sys.modules
