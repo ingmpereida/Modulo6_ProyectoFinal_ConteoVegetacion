@@ -12,6 +12,7 @@ imported at module level; the seam is load_model's lazy import.
 """
 
 import dataclasses
+import inspect
 import io
 import os
 import re
@@ -36,6 +37,15 @@ def test_importing_infer_never_imports_ultralytics():
 # ---------------------------------------------------------------------------
 # PR1 1.1: Box dataclass + filter_boxes (class + confidence filter)
 # ---------------------------------------------------------------------------
+
+
+class TestPlantClass:
+    def test_plant_class_constant_is_zero_and_is_the_filter_default(self):
+        # R2-004: the plant class (0) is a named exported constant and the
+        # default filter target — an unnamed assumption must never hide it.
+        assert infer.PLANT_CLASS == 0
+        default = inspect.signature(infer.filter_boxes).parameters["cls"].default
+        assert default == infer.PLANT_CLASS
 
 
 class TestBox:

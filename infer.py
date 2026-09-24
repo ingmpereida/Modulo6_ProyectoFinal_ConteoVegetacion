@@ -32,6 +32,7 @@ from PIL import Image
 
 
 __all__ = [
+    "PLANT_CLASS",
     "Box",
     "TileSpec",
     "PhotoResult",
@@ -50,6 +51,11 @@ __all__ = [
     "main",
 ]
 
+# class index of the plant in the trained data.yaml class order (R2-004).
+# Changing the class order in data.yaml changes what class 0 means and MUST
+# be paired with an update of this constant.
+PLANT_CLASS = 0
+
 
 @dataclass(frozen=True)
 class Box:
@@ -64,12 +70,15 @@ class Box:
     cls: int
 
 
-def filter_boxes(boxes: list[dict], conf: float, cls: int = 0) -> list[Box]:
+def filter_boxes(boxes: list[dict], conf: float, cls: int = PLANT_CLASS) -> list[Box]:
     """Keep detections of ``cls`` with confidence ``>= conf``, in input order.
 
     ``boxes`` is the raw predictor output: dicts with ``xyxy`` (list of 4
     floats), ``conf`` (float), ``cls`` (int). Returns frozen Boxes, so later
     pipeline stages (project/clip/NMS) can rely on immutability (FR-3).
+    The default ``cls`` is PLANT_CLASS (0) — the plant class index in the
+    trained data.yaml class order (R2-004); counts are always computed for
+    that class, so reordering data.yaml classes must update PLANT_CLASS.
     """
     kept: list[Box] = []
     for raw in boxes:
