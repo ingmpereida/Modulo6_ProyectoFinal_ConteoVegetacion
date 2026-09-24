@@ -9,6 +9,7 @@ module is a plain importable library — no CLI, no YOLO runtime.
 import dataclasses
 import io
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1204,6 +1205,44 @@ def _write_fake_ultralytics(root, pinned):
     return root
 
 
+def _f2_subprocess_fixture(tmp_path, make_tile_input):
+    """Build the F2 duplicate-tiles success run; return (args, env, out)."""
+    make_tile_input(
+        [
+            {
+                "flight": "F2",
+                "photo": "DJI_0002.JPG",
+                "photo_w": 960,
+                "photo_h": 640,
+                "tiles": [
+                    ("t1.png", 0, 0, 640, 640, 11),
+                    ("t2.png", 320, 0, 640, 640, 12),
+                ],
+            }
+        ]
+    )
+    (tmp_path / "w.pt").write_bytes(b"x")
+    stub = _write_fake_ultralytics(
+        tmp_path / "stub",
+        {
+            11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
+            12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
+        },
+    )
+    out = tmp_path / "counts.csv"
+    args = [
+        "--weights",
+        str(tmp_path / "w.pt"),
+        "--input",
+        str(tmp_path),
+        "--output",
+        str(out),
+        "--summary",
+        "--verbose",
+    ]
+    return args, _stub_env(stub), out
+
+
 class TestSubprocessCli:
     """Real-process CLI contract (PR3 3.6).
 
@@ -1278,40 +1317,7 @@ class TestSubprocessCli:
 
     def _f2_success_args(self, tmp_path, make_tile_input):
         """Build the F2 duplicate-tiles success run; return (args, env, out)."""
-        make_tile_input(
-            [
-                {
-                    "flight": "F2",
-                    "photo": "DJI_0002.JPG",
-                    "photo_w": 960,
-                    "photo_h": 640,
-                    "tiles": [
-                        ("t1.png", 0, 0, 640, 640, 11),
-                        ("t2.png", 320, 0, 640, 640, 12),
-                    ],
-                }
-            ]
-        )
-        (tmp_path / "w.pt").write_bytes(b"x")
-        stub = _write_fake_ultralytics(
-            tmp_path / "stub",
-            {
-                11: [{"xyxy": [400.0, 200.0, 480.0, 280.0], "conf": 0.9, "cls": 0}],
-                12: [{"xyxy": [80.0, 200.0, 160.0, 280.0], "conf": 0.8, "cls": 0}],
-            },
-        )
-        out = tmp_path / "counts.csv"
-        args = [
-            "--weights",
-            str(tmp_path / "w.pt"),
-            "--input",
-            str(tmp_path),
-            "--output",
-            str(out),
-            "--summary",
-            "--verbose",
-        ]
-        return args, _stub_env(stub), out
+        return _f2_subprocess_fixture(tmp_path, make_tile_input)
 
     def test_successful_directory_mode_writes_exact_csv_and_pins(
         self, tmp_path, make_tile_input
@@ -1336,3 +1342,53 @@ class TestSubprocessCli:
         second = _run_infer(args, env=env)
         assert first.returncode == second.returncode == 0
         assert out.read_bytes() == first_bytes  # NFR-3: identical inputs -> identical bytes
+
+
+# ---------------------------------------------------------------------------
+# PR3 3.8: gate — full-module contract through a real subprocess (no
+# ultralytics): importable module, --help reachable, byte-deterministic CSV,
+# and source free of absolute paths/timestamps (NFR-1, NFR-3).
+# ---------------------------------------------------------------------------
+
+
+class TestPr3Gate:
+    def test_module_imports_and_help_work_without_ultralytics(self):
+        # A real subprocess with NO fake ultralytics on PYTHONPATH completes
+        # both the import (lazy seam proven: no ModuleNotFoundError) and the
+        # --help path (rc 0, all args listed) — NFR-1 end to end.
+        script = str(Path(infer.__file__).resolve())
+        import_proc = subprocess.run(
+            [sys.executable, "-c", f"import importlib.util; assert importlib.util.find_spec('ultralytics') is None; import infer"],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ),
+        )
+        assert import_proc.returncode == 0
+        help_proc = _run_infer(["--help"])
+        assert help_proc.returncode == 0
+        for flag in ("--weights", "--input", "--output", "--conf", "--iou"):
+            assert flag in help_proc.stdout
+
+    def test_source_contains_no_absolute_paths_or_timestamps(self):
+        # NFR-3: CSV output must be byte-stable across runs. Absolute paths
+        # (machine-specific) and timestamps (volatile) are banned from the
+        # module source because they would leak into rendered rows or order.
+        src = Path(infer.__file__).read_text(encoding="utf-8")
+        assert not re.search(r"[A-Za-z]:\\", src)  # no Windows drive-letter literals
+        assert not re.search(r"\bdatetime\b|\bstrftime\b|\btime\.time\b", src)
+        assert "import datetime" not in src
+        assert "import time" not in src
+
+    def test_csv_output_is_deterministic_across_subprocess_runs(
+        self, tmp_path, make_tile_input
+    ):
+        # NFR-3 gate on the FULL module: two real subprocess runs of the same
+        # success scenario produce byte-identical CSVs (no RNG, no volatile
+        # ordering, no timestamps in the output).
+        args, env, out = _f2_subprocess_fixture(tmp_path, make_tile_input)
+        first = _run_infer(args, env=env)
+        assert first.returncode == 0
+        first_bytes = out.read_bytes()
+        second = _run_infer(args, env=env)
+        assert second.returncode == 0
+        assert out.read_bytes() == first_bytes
