@@ -19,6 +19,7 @@ Este README está escrito para que **una IA o una persona pueda entender el proy
 | `prepare_dataset.py` | Fase 2–3 — build del dataset YOLO: split por vuelo + `data.yaml` | Hecho (PR2) |
 | `train.py` | Fase 2–3 — entrenamiento YOLO26: train + val + métricas mAP | Hecho (PR3) |
 | `infer.py` | Fase 3 — conteo con modelo entrenado: CLI determinista + CSV con dedup NMS (Módulo 4) | Hecho (cambio `yolo-inference`) |
+| `convert_polygon_to_bbox.py` | Fase 2–3 — convierte etiquetas polígono de Roboflow a cajas YOLO (Módulo 5) | Hecho |
 
 El repositorio **git** se inicializó con el PR1 del cambio `yolo-training-pipeline` (rama `feat/yolo-pr1-repo`, base de la cadena `feat/yolo-training-pipeline`, commits convencionales); `.gitignore` excluye artefactos generados (`runs/`, `datasets/`, venv, caches, `node_modules/`). La lógica de detección sí tiene tests automatizados — ver *Tests automatizados*.
 
@@ -36,7 +37,7 @@ por color             generar manifest.csv         mAP                      Mód
 - **Fase 1**: `conteo_vegetacion.html` — conteo por color (Excess Green Index) + componentes conexas. Prototipo interactivo.
 - **Fase 2**: `tile_pipeline.py` — convierte fotos grandes en tiles etiquetables, descartando suelo vacío.
 - **Fase 2–3 (hecha)**: `prepare_dataset.py` convierte tiles + etiquetas YOLO en un dataset con split por vuelo; `train.py` entrena YOLO26 y reporta mAP50/mAP50-95 (ver Módulo 3).
-- **Fase 3 (hecha)**: `infer.py` cuenta plantas en fotos con un modelo entrenado, deduplicando por IoU en coordenadas globales (ver Módulo 4). Pendiente: correr un entrenamiento real con datos etiquetados de las parcelas.
+- **Fase 3 (hecha)**: `infer.py` cuenta plantas en fotos con un modelo entrenado, deduplicando por IoU en coordenadas globales (ver Módulo 4). **Piloto real completado** (Roboflow → entrenamiento → conteo) en septiembre 2026; el modelo piloto no generaliza (dataset de 6 tiles) — ver Módulo 5 para el flujo completo y requisitos de datos.
 
 ---
 
@@ -303,6 +304,142 @@ El CSV usa el header exacto `flight,photo,global_count,box_count,dedup_removed,s
 
 ---
 
+## Módulo 5 — Flujo completo paso a paso (de fotos a conteo, con Roboflow)
+
+Receta probada de punta a punta el 2026-09-24 (piloto real de 6 tiles). Sigue este orden en cada ronda de datos; cada paso consume la salida del anterior.
+
+### 5.1 Requisitos
+
+```bash
+pip install -r requirements.txt        # incluye ultralytics==8.4.161, opencv, PyYAML
+pip install roboflow                    # SDK para subir/exportar el dataset
+```
+
+Sin GPU el entrenamiento corre en CPU (lento con datasets grandes — ver 5.9).
+
+### 5.2 Paso 1 — Fotos por vuelo
+
+Organizar las fotos **en subcarpetas por vuelo** (`ParcelaX_AAAA-MM-DD_etapa`). Cada subcarpeta es un vuelo; el split train/valid de `prepare_dataset.py` es por vuelo, así que **más vuelos = mejor evaluación**:
+
+```
+fotos_dron/
+  Parcela01_2026-09-23_emergencia/
+    DJI_0001.JPG
+    DJI_0002.JPG
+  Parcela02_2026-09-23_emergencia/
+    ...
+```
+
+Evita poner fotos sueltas directo en `fotos_dron/`: eso crea UN solo vuelo y el split train/valid queda casi nulo (leakage).
+
+### 5.3 Paso 2 — Tiles
+
+```bash
+python tile_pipeline.py --input fotos_dron --output tiles
+#   vuela por carpeta, descarta suelo vacío, escribe tiles/*.jpg + tiles/manifest.csv
+```
+
+Reglas: imágenes < 640px se copian enteras; el traslape duplica plantas entre tiles adyacentes — **normal**, `infer.py` deduplica con NMS global al contar.
+
+### 5.4 Paso 3 — Etiquetar en Roboflow
+
+```python
+# scripts/roboflow_upload.py (patrón; usa ROBOFLOW_API_KEY de variable de entorno)
+import os, roboflow
+rf = roboflow.Roboflow(api_key=os.environ["ROBOFLOW_API_KEY"])
+ws = rf.workspace("TU_WORKSPACE")          # ej. cesar-geovanni-gmail-com
+try:
+    project = ws.project("conteovegetacion")
+except Exception:
+    project = ws.create_project(
+        project_name="conteovegetacion",
+        project_type="object-detection",
+        project_license="MIT",
+        annotation="plant",
+    )
+for img in sorted(Path("tiles").glob("**/*.jpg")):
+    project.upload(image_path=str(img))
+```
+
+Luego en `https://app.roboflow.com/<workspace>/conteovegetacion/annotate`: dibujar una caja o polígono por planta, clase `plant`. **Si etiquetás con polígonos, el export vuelve como polígono** y hay que convertirlo (Paso 5).
+
+### 5.5 Paso 4 — Generar versión y exportar (formato YOLO)
+
+```python
+# scripts/roboflow_export.py (patrón; ROBOFLOW_API_KEY en el entorno)
+project = rf.workspace("TU_WORKSPACE").project("conteovegetacion")
+version_no = project.generate_version(settings={"preprocessing": {"auto-orient": True}, "augmentation": {}})
+# esperar a que esté disponible, luego:
+ds = project.version(version_no).download(model_format="yolov8", location="datasets/roboflow_export", overwrite=True)
+```
+
+Descarga un árbol `train/{images,labels}` más `data.yaml` (no genera carpetas `valid/` con datasets chicos).
+
+### 5.6 Paso 5 — Convertir export a bbox (si venís de polígonos)
+
+```bash
+python convert_polygon_to_bbox.py \
+    --export datasets/roboflow_export/train \
+    --output datasets/labels_src/fotos_dron
+```
+
+Reconstruye el nombre original del tile (quita el sufijo `_jpg.rf.<hash>` de Roboflow) y convierte cada polígono a su bounding box (`class cx cy w h`). Si etiquetaste **cajas** en Roboflow, el export ya viene en formato caja; copiá las imágenes + `.txt` con los nombres originales igualmente (mismo layout de salida) sin este script.
+
+### 5.7 Paso 6 — Dataset local
+
+```bash
+python prepare_dataset.py \
+    --manifest tiles/manifest.csv \
+    --labels datasets/labels_src \
+    --output datasets/dataset
+#   escribe datasets/dataset/{images,labels}/{train,valid}/ + data.yaml (names: [plant])
+```
+
+Códigos: `0` éxito, `1` dato inválido (no escribe nada), `2` uso inválido. Un sidecar malformado falla a propósito (fail fast).
+
+### 5.8 Paso 7 — Entrenar
+
+```bash
+python train.py --data datasets/dataset/data.yaml --epochs 100 --imgsz 640 --batch 8
+#   best.pt en runs/detect/runs/train/weights/ (default --project runs/)
+#   mAP50 / mAP50-95 se imprimen al final
+```
+
+Al terminar, `best.pt` es el modelo a usar en el Paso 8. Con datasets chicos, baja `--epochs` (30 bastan como smoke test, ~45 s en CPU con 5 imágenes).
+
+### 5.9 Paso 8 — Contar (inferencia)
+
+```bash
+python infer.py --weights runs/detect/runs/train/weights/best.pt \
+    --input datos_tiles --output counts.csv --summary --verbose
+#   datos_tiles/ debe contener manifest.csv + tiles/ (o una foto suelta)
+```
+
+`--conf`/`--iou` ajustables (defaults 0.25 / 0.5); exit codes 0/1/2; CSV con header `flight,photo,global_count,box_count,dedup_removed,source_tiles`.
+
+### 5.10 Scripts de referencia
+
+Los patrones de upload/export con Roboflow no están versionados como scripts aparte (solo la API key en variable de entorno, nunca en el repo) más allá de este README; `convert_polygon_to_bbox.py` sí está en el repo porque es lógica de datos determinista.
+
+### 5.11 Requisitos de datos — ¿cuántas imágenes hacen falta?
+
+| Escenario | Tiles etiquetados | Resultado esperado |
+|---|---|---|
+| Smoke test del flujo (lo que hicimos) | ~6 | El pipeline corre, mAP ≈ 0, el modelo no generaliza |
+| Mínimo para "aprender" | **~100–200** (3+ vuelos) | El modelo captura el patrón visual: mAP50 observable, útil para iterar |
+| Modelo usable de conteo | **300–600+** (5+ vuelos, varias etapas/fechas) | mAP50 alto, conteo confiable en fotos nuevas |
+
+Reglas prácticas:
+
+1. **Una clase (plant)** con **objetos pequeños**: necesitás más ejemplos que un detector de objetos grandes. Regla de oro del etiquetado: **~150 ejemplares (instancias) por clase** como piso; cada tile aporta 3–10 plantas, así que 20–50 tiles ya tienen ~150 instancias — pero la **variedad** importa más que el total.
+2. **≥ 3 vuelos distintos** (ideal 5+): el split por vuelo de `prepare_dataset.py` necesita vuelos completos para validar sin leakage. Con 1 vuelo no hay evaluación honesta.
+3. **Variedad de etapas y luces**: si el modelo solo vio una fecha/luz, falla en campo. Incluye emergencia, crecimiento, y distintas condiciones de sol/sombra.
+4. El **overlap de tiles** permite reutilizar la misma foto en varios tiles (cada tile se etiqueta aparte), pero los tiles de un mismo vuelo comparten plantas: sirven para entrenar, no para evaluar (ver 3.3).
+
+Referencia rápida: para una primera iteración realista apuntá a **3–4 vuelos × 5–8 fotos c/u × ~4–6 tiles por foto ≈ 100–200 tiles etiquetados**. Eso alcanza para aprender; después se escala.
+
+---
+
 ## Flujo de datos completo (cómo encajan las piezas)
 
 ```
@@ -313,9 +450,10 @@ Foto de dron (celular/dron/ortomosaico)
   │
   └─► Fase 2: tile_pipeline.py (preparación para ML)
         fotos → tiles etiquetables + manifest.csv
-        → etiquetas YOLO (sidecars .txt) → prepare_dataset.py → train.py
-        → modelo entrenado (mAP en consola) → infer.py (Módulo 4)
-        → counts.csv (conteo por foto y por vuelo)
+        → etiquetar en Roboflow (cajas o polígonos, clase plant)
+        → exportar YOLO + convert_polygon_to_bbox.py (si polígonos)
+        → prepare_dataset.py → train.py → modelo entrenado (best.pt, mAP en consola)
+        → infer.py (Módulo 4) → counts.csv (conteo por foto y por vuelo)
 
 > Nota de alcance: el conteo con IA (`infer.py`) es un CLI de Python; la app
 > HTML `conteo_vegetacion.html` sigue con su camino clásico por color (Fase 1).
@@ -382,7 +520,7 @@ python3 tile_pipeline.py --input ./fotos_dron --output ./tiles
 
 1. ~~Inicializar **git** (repo + commits conventionales) y añadir `.gitignore`.~~ — **hecho** en el PR1 del cambio `yolo-training-pipeline`.
 2. **Fase 2–3** (cambio `yolo-training-pipeline`): ~~etiquetar tiles en Roboflow/CVAT usando el `manifest.csv`; `prepare_dataset.py` con split por vuelo y `data.yaml` (PR2) y `train.py` con YOLO26 + validación (PR3)~~ — **hecho**: ver Módulo 3; queda pendiente etiquetar datos reales y correr el primer entrenamiento.
-3. **Fase 3** (cambio `yolo-inference`): ~~`infer.py` — CLI determinista de conteo con modelo entrenado, dedup por IoU global, modos directorio/foto única, exit codes 0/1/2~~ — **hecho**: ver Módulo 4. Una vez existan pesos reales (punto 2), correr `python infer.py --weights runs/train/exp/weights/best.pt --input <carpeta con manifest.csv + tiles/> --output counts.csv`.
+3. **Fase 3** (cambio `yolo-inference`): ~~`infer.py` — CLI determinista de conteo con modelo entrenado, dedup por IoU global, modos directorio/foto única, exit codes 0/1/2~~ — **hecho**: ver Módulo 4; el **piloto real** (Roboflow → entrenamiento → conteo con `best.pt`) se completó y quedó documentado en el Módulo 5. Pendiente: **datasets grandes** (Módulo 5.11) para un modelo que generalice.
 4. Optimización opcional: `OffscreenCanvas` dentro del worker para evitar el `getImageData`/transferencia en el hilo principal.
 
 ---
@@ -399,6 +537,7 @@ python3 tile_pipeline.py --input ./fotos_dron --output ./tiles
 | **UI/UX v2** | Feedback de procesamiento (botón con spinner y badge "analizando a resolución completa…" con anillo), metadatos de la imagen cargada (nombre + dimensiones, deja claro que se procesa la original), guía contextual cuando no se detectan plantas (sugiere bajar Índice de verdor o Tamaño mínimo), toasts con `role="status"` (descarga exitosa, archivo inválido, fallback sin worker), accesibilidad (`aria-live="polite"` en los readouts), micro-interacciones (pulse del contador, hover con sombra en la zona de subida) y ajustes para pantallas ≤ 480 px. |
 | **CSS profesional (auditoría de UI/UX)** | Cierre de huecos detectados en revisión del CSS: slider estilizado para Firefox (`::-moz-range-track/thumb`), todos los colores pasaron a tokens (`--sand`, `--sand-tint`, `--switch-off`, `--sage-bright`, `--warn-*`, `--danger` ya existía; queda literal solo `#fff`), `prefers-reduced-motion` para desactivar animaciones, `color-scheme: light` (evita estilos oscuros de UA en controles nativos), `-webkit-tap-highlight-color` transparente en móvil, `aria-hidden="true"` en las 4 SVGs decorativas (incluida la del template de `buildStage`), selector `.readout` duplicado unificado, y en ≤860 px el resultado pasa primero (`order:-1`) con header apilado. Verificado: llaves CSS balanceadas, `node --check` OK, 8/8 tests. |
 | **Módulo 4 — `infer.py`** (cambio `yolo-inference`) | Motor de conteo con modelo entrenado como CLI de Python: `load_model` es el único seam a ultralytics (import diferido dentro de la función, NFR-1) y el resto de la pipeline consume el duck-type `predict(image) -> [Box]` — todo corre en CPU sin runtime. `main()`/argparse (FR-1): `--weights` (existente y legible, exit 2 si no), `--input` (directorio con `manifest.csv` + `tiles/` o foto única), `--output`, `--conf` 0.25, `--iou` 0.5, `--summary`, `--verbose`; salidas 0/1/2, nada se escribe ante error (NFR-6, validate-then-write). Dedup por proyección global + IoU NMS determinista (sin RNG); CSV byte-idéntico entre corridas (NFR-3). Tests: 8 subprocess con paquete `ultralytics` falso en PYTHONPATH + unit del adapter. No es IA en el navegador: la app HTML mantiene su conteo clásico. |
+| **Piloto real D8 — Roboflow → entrenamiento → conteo** (2026-09-24) | Se validó el seam completo de `infer.py` contra el runtime real: 6 tiles etiquetados en Roboflow (clase `plant`, proyecto `conteovegetacion`), versión 1 generada y exportada en `yolov8`, labels convertidos de polígono a bbox con `convert_polygon_to_bbox.py` (nuevo script versionado), `prepare_dataset.py` → `datasets/dataset` (5 train / 1 valid), `train.py --epochs 30` en CPU → `best.pt` (mAP50 ≈ 0 — esperado con 5 imágenes), `infer.py --weights best.pt` → CSV con 0 detecciones, exit 0. Resultado: el **hito D8 quedó cerrado** (el código funciona contra ultralytics real); el modelo no generaliza por falta de datos (Módulo 5.11). Documentado todo en Módulo 5. |
 
 ## Relación con la memoria persistente (Engram)
 
